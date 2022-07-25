@@ -19,16 +19,17 @@
 #define PIN_CLK  22
 #define PIN_DATA 21
 const i2s_port_t I2S_PORT = I2S_NUM_0;
-const int BLOCK_SIZE = 512;
+const int BLOCK_SIZE = 2000;
 int16_t samples[BLOCK_SIZE];
-#define SAMPLE_RATE 24000
+#define SAMPLE_RATE 16000
 long total_read = 0;
-
+#define MICROPHONE_SENSITIVITY -26 // -26 dB(FS) @ 1khz 94 dB
+#include <limits.h>
 
 
 #define TFT_GREY 0x5AEB
 
-#define LOOP_PERIOD 35  // Display updates every 35 ms
+#define LOOP_PERIOD 125  // Display updates every x ms
 #define MIN_VALUE 30
 #define MAX_VALUE 110
 
@@ -47,33 +48,32 @@ int display_rms = 0;
 double display_dbspl = 0.0f;
 
 
-// http://www.schwietering.com/jayduino/filtuino/index.php?characteristic=be&passmode=hp&order=2&usesr=usesr&sr=24000&frequencyLow=100&noteLow=&noteHigh=&pw=pw&calctype=float&run=Send
-//High pass bessel filter order=2 alpha1=0.0041666666666667 
-class  FilterBeHp2
+//High pass butterworth filter order=2 alpha1=0.00625 
+class  Filter
 {
   public:
-    FilterBeHp2()
+    Filter()
     {
       v[0]=0.0;
       v[1]=0.0;
     }
   private:
-    float v[3];
+    double v[3];
   public:
-    float step(float x) //class II 
+    double step(double x) //class II 
     {
       v[0] = v[1];
       v[1] = v[2];
-      v[2] = (9.823849154958753660e-1 * x)
-         + (-0.96497792085018785357 * v[0])
-         + (1.96456174113331383246 * v[1]);
+      v[2] = (9.726138984998438097e-1 * x)
+         + (-0.94597793623228154658 * v[0])
+         + (1.94447765776709369234 * v[1]);
       return 
          (v[0] + v[2])
         - 2 * v[1];
     }
 };
 
-FilterBeHp2 filter;
+Filter buttHighPass;
 
 void init_pdm() {
   
@@ -87,7 +87,7 @@ void init_pdm() {
          .communication_format = I2S_COMM_FORMAT_STAND_I2S,
          .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1, // high interrupt priority
          .dma_buf_count = 2,
-         .dma_buf_len = BLOCK_SIZE
+         .dma_buf_len = 128
         };
     
     // This function must be called before any I2S driver read/write operations.
@@ -125,7 +125,7 @@ void process_samples(void *pvParameters) {
       size_t num_bytes_read;
       i2s_read(I2S_PORT, 
           (char *)samples, 
-          BLOCK_SIZE * 2,
+          BLOCK_SIZE,
           &num_bytes_read,
           portMAX_DELAY); // no timeout
       if (num_bytes_read > 0) {            
@@ -134,11 +134,14 @@ void process_samples(void *pvParameters) {
         float sample;
         double rms = 0;
         for(int i=0; i < samples_read; i++) {
-          sample = filter.step((float)(samples[i] / 32767));
-          rms += samples[i];
+          double v = buttHighPass.step((double)samples[i]);
+          rms += v * v;
+          //Serial.println(v);
         }            
+        rms = sqrt(rms / samples_read);
         display_rms = rms;
-        display_dbspl = 20 * log10(sqrt(rms / samples_read));
+        double dbfs = 20 * log10(rms / SHRT_MAX);
+        display_dbspl = dbfs + (94 - MICROPHONE_SENSITIVITY);
       }
     }
 }
@@ -163,12 +166,7 @@ void setup(void) {
 void loop() {
     if (updateTime <= millis()) {
         updateTime = millis() + LOOP_PERIOD;
-
-        d += 4;
-        if (d >= 360) d = 0;
-        
-        int val_db = 60.5 + 10.5 * sin((d + 0) * DEGTORAD);
-        plotNeedle(tft_settings.tft_height, tft_settings.tft_width,val_db, 0);
+        plotNeedle(tft_settings.tft_height, tft_settings.tft_width, display_dbspl, 0);
     }
 }
 
@@ -298,10 +296,12 @@ void plotNeedle(int width, int height, int value, byte ms_delay) {
 
     M5.Lcd.setTextColor(TFT_BLACK, TFT_WHITE);
     char buf[40];
-    int l = sprintf(buf, "%d RMS", display_rms);
+    sprintf(buf, "RMS: %d   ", display_rms);
     M5.Lcd.setTextFont(2);
     M5.Lcd.setTextDatum(BL_DATUM);
     M5.Lcd.drawString(buf, border * 2, height * 0.6);
+    sprintf(buf, "SPL: %.1f dB", display_dbspl);
+    M5.Lcd.drawString(buf, border * 2, height * 0.6 + 20);
 
     if (value < MIN_VALUE - 10) value = MIN_VALUE - 10;  // Limit value to emulate needle end stops
     if (value > MAX_VALUE + 10) value = MAX_VALUE + 10;
