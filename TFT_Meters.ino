@@ -61,7 +61,7 @@ void loop() {
         d += 4;
         if (d >= 360) d = 0;
         
-        int val_db = 61 + 10 * sin((d + 0) * DEGTORAD);
+        int val_db = 60.5 + 10.5 * sin((d + 0) * DEGTORAD);
         plotNeedle(tft_settings.tft_height, tft_settings.tft_width,val_db, 0);
     }
 }
