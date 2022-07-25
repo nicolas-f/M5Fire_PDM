@@ -25,6 +25,7 @@ float ltx    = 0;               // Saved x coord of bottom of needle
 uint16_t osx = 120, osy = 120;  // Saved x & y coords
 uint32_t updateTime = 0;        // time for next update
 
+setup_t tft_settings;
 int old_analog  = -999;  // Value last displayed
 
 int d            = 0;
@@ -43,7 +44,6 @@ void setup(void) {
     
     M5.Lcd.fillScreen(TFT_BLACK);
 
-    setup_t tft_settings;
     M5.Lcd.getSetup(tft_settings);
 
     //print_number(tft_settings.tft_width, 0, 0, 150);
@@ -62,7 +62,7 @@ void loop() {
         if (d >= 360) d = 0;
         
         int val_db = 40 + 8 * sin((d + 0) * DEGTORAD);
-        plotNeedle(int, 0);
+        //plotNeedle(tft_settings.tft_height, tft_settings.tft_width,val_db, 0);
     }
 }
 
@@ -73,6 +73,8 @@ void analogMeter(int width, int height, int pos_x, int pos_y) {
     // Meter outline
     M5.Lcd.fillRect(pos_x, pos_y, width, height, TFT_GREY);
     int border = 3;
+    int ticks_width = (width - border * 2) / 2;
+    int position_midle_analog = ticks_width;
     M5.Lcd.fillRect(pos_x + border, pos_y + border, width - border * 2, height - border * 2, TFT_WHITE);
 
     M5.Lcd.setTextColor(TFT_BLACK);  // Text colour
@@ -85,24 +87,18 @@ void analogMeter(int width, int height, int pos_x, int pos_y) {
         // Coodinates of tick to draw
         float sx    = cos((i - 90) * DEGTORAD);
         float sy    = sin((i - 90) * DEGTORAD);
-        uint16_t x0 = sx * (100 + tl) + 120;
+        uint16_t x0 = sx * (ticks_width + tl) + position_midle_analog;
         uint16_t y0 = sy * (100 + tl) + 140;
-        uint16_t x1 = sx * 100 + 120;
+        uint16_t x1 = sx * ticks_width + position_midle_analog;
         uint16_t y1 = sy * 100 + 140;
 
         // Coordinates of next tick for zone fill
         float sx2 = cos((i + 5 - 90) * DEGTORAD);
         float sy2 = sin((i + 5 - 90) * DEGTORAD);
-        int x2    = sx2 * (100 + tl) + 120;
+        int x2    = sx2 * (ticks_width + tl) + position_midle_analog;
         int y2    = sy2 * (100 + tl) + 140;
-        int x3    = sx2 * 100 + 120;
+        int x3    = sx2 * ticks_width + position_midle_analog;
         int y3    = sy2 * 100 + 140;
-
-        // Yellow zone limits
-        // if (i >= -50 && i < 0) {
-        //  M5.Lcd.fillTriangle(x0, y0, x1, y1, x2, y2, TFT_YELLOW);
-        //  M5.Lcd.fillTriangle(x1, y1, x2, y2, x3, y3, TFT_YELLOW);
-        //}
 
         // Green zone limits
         if (i >= 0 && i < 25) {
@@ -120,9 +116,9 @@ void analogMeter(int width, int height, int pos_x, int pos_y) {
         if (i % 25 != 0) tl = 8;
 
         // Recalculate coords incase tick lenght changed
-        x0 = sx * (100 + tl) + 120;
+        x0 = sx * (ticks_width + tl) + position_midle_analog;
         y0 = sy * (100 + tl) + 140;
-        x1 = sx * 100 + 120;
+        x1 = sx * ticks_width + position_midle_analog;
         y1 = sy * 100 + 140;
 
         // Draw tick
@@ -131,7 +127,7 @@ void analogMeter(int width, int height, int pos_x, int pos_y) {
         // Check if labels should be drawn, with position tweaks
         if (i % 25 == 0) {
             // Calculate label positions
-            x0 = sx * (100 + tl + 10) + 120;
+            x0 = sx * (ticks_width + tl + 10) + position_midle_analog;
             y0 = sy * (100 + tl + 10) + 140;
             switch (i / 25) {
                 case -2:
@@ -155,18 +151,18 @@ void analogMeter(int width, int height, int pos_x, int pos_y) {
         // Now draw the arc of the scale
         sx = cos((i + 5 - 90) * DEGTORAD);
         sy = sin((i + 5 - 90) * DEGTORAD);
-        x0 = sx * 100 + 120;
+        x0 = sx * ticks_width + position_midle_analog;
         y0 = sy * 100 + 140;
         // Draw scale arc, don't draw the last part
         if (i < 50) M5.Lcd.drawLine(x0, y0, x1, y1, TFT_BLACK);
     }
+    M5.Lcd.setTextDatum(BR_DATUM);
+    M5.Lcd.drawString("dB(A)", width - border, 119 - 20);  
+    
+    M5.Lcd.drawCentreString("dB(A)", position_midle_analog, 70, 4);  // Comment out to avoid font 4
+    M5.Lcd.drawRect(pos_x + border, pos_y + border, width - border * 2, height - border * 2, TFT_BLACK);  // Draw bezel line
 
-    M5.Lcd.drawString("dB(A)", 5 + 230 - 40, 119 - 20,
-                      2);                        // Units at bottom right
-    M5.Lcd.drawCentreString("dB(A)", 120, 70, 4);  // Comment out to avoid font 4
-    M5.Lcd.drawRect(5, 3, 230, 119, TFT_BLACK);  // Draw bezel line
-
-    plotNeedle(0, 0);  // Put meter needle at 0
+    //plotNeedle(tft_settings.tft_height, tft_settings.tft_width, 0, 0);  // Put meter needle at 0
 }
 
 // #########################################################################
@@ -176,7 +172,9 @@ void analogMeter(int width, int height, int pos_x, int pos_y) {
 // Smaller values OK if text not in sweep area, zero for instant movement but
 // does not look realistic... (note: 100 increments for full scale deflection)
 // #########################################################################
-void plotNeedle(int value, byte ms_delay) {
+void plotNeedle(int width, int height, int value, byte ms_delay) {
+    int border = 3;
+    int ticks_width = (width - border * 2) / 2;
     M5.Lcd.setTextColor(TFT_BLACK, TFT_WHITE);
     char buf[8];
     dtostrf(value, 4, 0, buf);
@@ -216,7 +214,7 @@ void plotNeedle(int value, byte ms_delay) {
 
         // Store new needle end coords for next erase
         ltx = tx;
-        osx = sx * 98 + 120;
+        osx = sx * ticks_width - 2 + 120;
         osy = sy * 98 + 140;
 
         // Draw the needle in the new postion, magenta makes needle a bit bolder
