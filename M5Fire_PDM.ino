@@ -1,358 +1,218 @@
-/*
-  Example animated analogue meters using a ILI9341 TFT LCD screen
+#include <M5Unified.h>
+#include <arduinoFFT.h> // Install the arduinoFFT library v2.0.4 from https://github.com/kosme/arduinoFFT 
+#include <driver/i2s_pdm.h>
+#include <math.h>
 
-  Needs Font 2 (also Font 4 if using large scale label)
+// Left side of the Fire with the M5 Grove PDM Mic plugged
+#define GROVE_B_PIN_CLK   22 
+#define GROVE_B_PIN_DATA  21 
 
-  Make sure all the display driver and pin comnenctions are correct by
-  editting the User_Setup.h file in the TFT_eSPI library folder.
+#define SCREEN_WIDTH          320
+#define SCREEN_HEIGHT         240
+#define HEADER_HEIGHT         38
+#define SPECTROGRAM_HEIGHT    (SCREEN_HEIGHT - HEADER_HEIGHT) // 202 pixels
+#define SPECTROGRAM_WIDTH     SCREEN_WIDTH                    // 320 pixels
 
-  #########################################################################
-  ###### DON'T FORGET TO UPDATE THE User_Setup.h FILE IN THE LIBRARY ######
-  #########################################################################
-*/
+#define SIGNAL_LENGTH         512
+#define SAMPLINGFREQUENCY     16000
+#define MAX_DISPLAY_FREQ      6000  // 0 to 6000 Hz vertical range
 
-#include <M5Stack.h>
-#include "driver/i2s.h"
+// FFT buffers
+int16_t stereoSamples[SIGNAL_LENGTH * 2];
+double adcBuffer[SIGNAL_LENGTH];
+double vImag[SIGNAL_LENGTH];
 
+ArduinoFFT<double> FFT = ArduinoFFT<double>(adcBuffer, vImag, SIGNAL_LENGTH, SAMPLINGFREQUENCY);
 
+// I2S Channel Handle
+i2s_chan_handle_t rx_chan = NULL;
 
-#define PIN_CLK  22
-#define PIN_DATA 21
-const i2s_port_t I2S_PORT = I2S_NUM_0;
-const int BLOCK_SIZE = 2000;
-int16_t samples[BLOCK_SIZE];
-#define SAMPLE_RATE 16000
-long total_read = 0;
-#define MICROPHONE_SENSITIVITY -26 // -26 dB(FS) @ 1khz 94 dB
-#include <limits.h>
+// In-memory Canvas for fast hardware scrolling
+M5Canvas spectrogram(&M5.Display);
 
+// 256-level Black -> Purple -> Magenta -> Pink color lookup table
+uint16_t colorLUT[256];
 
-#define TFT_GREY 0x5AEB
+void initColorMap() {
+    for (int i = 0; i < 256; i++) {
+        float t = i / 255.0f;
+        uint8_t r = 0, g = 0, b = 0;
 
-#define LOOP_PERIOD 125  // Display updates every x ms
-#define MIN_VALUE 30
-#define MAX_VALUE 110
-
-#define DEGTORAD 0.0174532925 // degree to radian
-
-float ltx    = 0;               // Saved x coord of bottom of needle
-uint16_t osx = 120, osy = 120;  // Saved x & y coords
-uint32_t updateTime = 0;        // time for next update
-
-setup_t tft_settings;
-int old_analog  = -999;  // Value last displayed
-
-int d            = 0;
-
-int display_rms = 0;
-double display_dbspl = 0.0f;
-
-
-//High pass butterworth filter order=2 alpha1=0.00625 
-class  Filter
-{
-  public:
-    Filter()
-    {
-      v[0]=0.0;
-      v[1]=0.0;
+        if (t < 0.25f) {
+            // Level 0..63: Black (0,0,0) -> Deep Purple (70,0,90)
+            float f = t / 0.25f;
+            r = (uint8_t)(70 * f);
+            g = 0;
+            b = (uint8_t)(90 * f);
+        } else if (t < 0.50f) {
+            // Level 64..127: Deep Purple -> Magenta (170,10,140)
+            float f = (t - 0.25f) / 0.25f;
+            r = (uint8_t)(70 + (170 - 70) * f);
+            g = (uint8_t)(10 * f);
+            b = (uint8_t)(90 + (140 - 90) * f);
+        } else if (t < 0.75f) {
+            // Level 128..191: Magenta -> Hot Pink (255,50,170)
+            float f = (t - 0.50f) / 0.25f;
+            r = (uint8_t)(170 + (255 - 170) * f);
+            g = (uint8_t)(10 + (50 - 10) * f);
+            b = (uint8_t)(140 + (170 - 140) * f);
+        } else {
+            // Level 192..255: Hot Pink -> Luminous Pastel Pink (255,180,225)
+            float f = (t - 0.75f) / 0.25f;
+            r = 255;
+            g = (uint8_t)(50 + (180 - 50) * f);
+            b = (uint8_t)(170 + (225 - 170) * f);
+        }
+        colorLUT[i] = M5.Display.color565(r, g, b);
     }
-  private:
-    double v[3];
-  public:
-    double step(double x) //class II 
-    {
-      v[0] = v[1];
-      v[1] = v[2];
-      v[2] = (9.726138984998438097e-1 * x)
-         + (-0.94597793623228154658 * v[0])
-         + (1.94447765776709369234 * v[1]);
-      return 
-         (v[0] + v[2])
-        - 2 * v[1];
-    }
-};
+}
 
-Filter buttHighPass;
+bool init_pdm() {
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    if (i2s_new_channel(&chan_cfg, NULL, &rx_chan) != ESP_OK) return false;
 
-void init_pdm() {
-  
-    esp_err_t err;
-
-    i2s_config_t audio_in_i2s_config = {
-         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
-         .sample_rate = SAMPLE_RATE,
-         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, // although the SEL config should be left, it seems to transmit on right
-         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1, // high interrupt priority
-         .dma_buf_count = 2,
-         .dma_buf_len = 128
-        };
-    
-    // This function must be called before any I2S driver read/write operations.
-    err = i2s_driver_install(I2S_PORT, &audio_in_i2s_config, 0, NULL);
-    if (err != ESP_OK) {
-      Serial.printf("Failed installing driver: %d\n", err);
-      while (true);
-    }
-  
-    // configure which pin on the ESP32 is connected to which pin on the mic:
-    i2s_pin_config_t audio_in_pin_config = {
-        .bck_io_num = I2S_PIN_NO_CHANGE, // not used
-        .ws_io_num = PIN_CLK,  // IO 15 clock pin
-        .data_out_num = I2S_PIN_NO_CHANGE, // Not used
-        .data_in_num = PIN_DATA   // data pin
+    i2s_pdm_rx_config_t pdm_rx_cfg = {
+        .clk_cfg  = I2S_PDM_RX_CLK_DEFAULT_CONFIG(SAMPLINGFREQUENCY),
+        .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .clk = (gpio_num_t)GROVE_B_PIN_CLK,
+            .din = (gpio_num_t)GROVE_B_PIN_DATA,
+            .invert_flags = { .clk_inv = false },
+        },
     };
-    
-    err = i2s_set_pin(I2S_PORT, &audio_in_pin_config);
-    if (err != ESP_OK) {
-      Serial.printf("Failed setting pin: %d\n", err);
-      while (true);
+
+    if (i2s_channel_init_pdm_rx_mode(rx_chan, &pdm_rx_cfg) != ESP_OK) return false;
+    return (i2s_channel_enable(rx_chan) == ESP_OK);
+}
+
+// Bounded peak detector (ignores DC hum and PDM quantization noise)
+double getCleanPeakFrequency() {
+    double maxY = 0;
+    int maxBin = 0;
+    int minBin = 3; // ~94 Hz
+    int maxBinLimit = (int)((MAX_DISPLAY_FREQ / (double)SAMPLINGFREQUENCY) * SIGNAL_LENGTH);
+
+    for (int i = minBin; i <= maxBinLimit; i++) {
+        if (adcBuffer[i] > maxY) {
+            maxY = adcBuffer[i];
+            maxBin = i;
+        }
     }
+
+    if (maxBin <= minBin || maxY < 5.0) return 0.0;
+
+    double y1 = adcBuffer[maxBin - 1];
+    double y2 = adcBuffer[maxBin];
+    double y3 = adcBuffer[maxBin + 1];
+    double delta = 0.5 * (y1 - y3) / (y1 - 2.0 * y2 + y3);
+
+    return ((double)maxBin - delta) * ((double)SAMPLINGFREQUENCY / SIGNAL_LENGTH);
 }
 
-void print_number(double val, int precision, int x, int y) {
-    char buf[16];
-    dtostrf(val, 4, precision, buf);
-    M5.Lcd.setTextFont(2);
-    M5.Lcd.setTextDatum(MC_DATUM);
-    M5.Lcd.drawString(buf, x, y);  
-}
+void setup() {
+    auto cfg = M5.config();
+    cfg.serial_baudrate = 115200;
+    cfg.internal_spk    = false;
+    cfg.internal_mic    = false;
+    M5.begin(cfg);
 
-void process_samples(void *pvParameters) {  
-    while(1){
-      size_t num_bytes_read;
-      i2s_read(I2S_PORT, 
-          (char *)samples, 
-          BLOCK_SIZE,
-          &num_bytes_read,
-          portMAX_DELAY); // no timeout
-      if (num_bytes_read > 0) {            
-        int samples_read = num_bytes_read / 2;
-        total_read += samples_read;
-        float sample;
-        double rms = 0;
-        for(int i=0; i < samples_read; i++) {
-          double v = buttHighPass.step((double)samples[i]);
-          rms += v * v;
-          //Serial.println(v);
-        }            
-        rms = sqrt(rms / samples_read);
-        display_rms = rms;
-        double dbfs = 20 * log10(rms / SHRT_MAX);
-        display_dbspl = dbfs + (94 - MICROPHONE_SENSITIVITY);
-      }
-    }
-}
-
-void setup(void) {
-    M5.begin();
-    M5.Power.begin();
-    
-    // Initialize the I2S peripheral
+    initColorMap();
     init_pdm();
-    // Create a task that will read the data
-    xTaskCreatePinnedToCore(process_samples, "PDM_reader", 2048, NULL, 1, NULL, 1);
 
-    M5.Lcd.fillScreen(TFT_BLACK);
+    // Create the off-screen canvas for the scrolling waterfall
+    spectrogram.setColorDepth(16);
+    spectrogram.createSprite(SPECTROGRAM_WIDTH, SPECTROGRAM_HEIGHT);
+    spectrogram.fillSprite(TFT_BLACK);
 
-    M5.Lcd.getSetup(tft_settings);
-
-    analogMeter(tft_settings.tft_height, tft_settings.tft_width, 0, 0);  // Draw analogue meter
-    updateTime = millis();  // Next update time
+    // Initial display frame
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.fillRect(0, 0, SCREEN_WIDTH, HEADER_HEIGHT, 0x18C3); // Dark slate header
+    M5.Display.setTextColor(TFT_WHITE, 0x18C3);
+    M5.Display.setTextSize(1);
+    M5.Display.setCursor(6, 4);
+    M5.Display.print("SPECTROGRAM (0 - 6 kHz)");
+    M5.Display.setCursor(6, 20);
+    M5.Display.print("Time -> (Sliding Left)");
 }
 
-void loop() {
-    if (updateTime <= millis()) {
-        updateTime = millis() + LOOP_PERIOD;
-        plotNeedle(tft_settings.tft_height, tft_settings.tft_width, display_dbspl, 0);
+double smoothedFreq = 0.0;
+
+void loop(void) {
+    M5.update();
+    if (!rx_chan) return;
+
+    // 1. Read DMA stereo samples
+    size_t bytes_read = 0;
+    esp_err_t err = i2s_channel_read(rx_chan, (void *)stereoSamples, sizeof(stereoSamples), &bytes_read, 1000 / portTICK_PERIOD_MS);
+    if (err != ESP_OK || bytes_read == 0) return;
+
+    // 2. Lock to Left channel & remove DC bias
+    int64_t sum = 0;
+    for (int n = 0; n < SIGNAL_LENGTH; n++) {
+        sum += stereoSamples[n * 2];
     }
-}
+    double mean = (double)sum / SIGNAL_LENGTH;
 
-// #########################################################################
-//  Draw the analogue meter on the screen
-// #########################################################################
-void analogMeter(int width, int height, int pos_x, int pos_y) {
-    // Meter outline
-    M5.Lcd.fillRect(pos_x, pos_y, width, height, TFT_GREY);
-    int border = 3;
-    int ticks_width = (width - border * 2) * 0.4;
-    int ticks_height = (height - border * 2) / 2;
-    int position_midle_analog = width * 0.5;
-    int yposition_midle_analog = height * 0.8;
-    int long_scale_length = 30;
-    int short_scale_length = 16;
-    M5.Lcd.fillRect(pos_x + border, pos_y + border, width - border * 2, height - border * 2, TFT_WHITE);
-
-    M5.Lcd.setTextColor(TFT_BLACK);  // Text colour
-
-    // Draw ticks every 5 degrees from -50 to +50 degrees (100 deg. FSD swing)
-    for (int i = -50; i <= 50; i += 5) {
-        // Long scale tick length
-        int tl = long_scale_length;
-
-        // Coodinates of tick to draw
-        float sx    = cos((i - 90) * DEGTORAD);
-        float sy    = sin((i - 90) * DEGTORAD);
-        uint16_t x0 = sx * (ticks_width + tl) + position_midle_analog;
-        uint16_t y0 = sy * (ticks_height + tl) + yposition_midle_analog;
-        uint16_t x1 = sx * ticks_width + position_midle_analog;
-        uint16_t y1 = sy * ticks_height + yposition_midle_analog;
-
-        // Coordinates of next tick for zone fill
-        float sx2 = cos((i + 5 - 90) * DEGTORAD);
-        float sy2 = sin((i + 5 - 90) * DEGTORAD);
-        int x2    = sx2 * (ticks_width + tl) + position_midle_analog;
-        int y2    = sy2 * (ticks_height + tl) + yposition_midle_analog;
-        int x3    = sx2 * ticks_width + position_midle_analog;
-        int y3    = sy2 * ticks_height + yposition_midle_analog;
-
-        // Green zone limits
-        if (i >= 0 && i < 25) {
-            M5.Lcd.fillTriangle(x0, y0, x1, y1, x2, y2, TFT_GREEN);
-            M5.Lcd.fillTriangle(x1, y1, x2, y2, x3, y3, TFT_GREEN);
-        }
-
-        // Orange zone limits
-        if (i >= 25 && i < 50) {
-            M5.Lcd.fillTriangle(x0, y0, x1, y1, x2, y2, TFT_ORANGE);
-            M5.Lcd.fillTriangle(x1, y1, x2, y2, x3, y3, TFT_ORANGE);
-        }
-
-        // Short scale tick length
-        if (i % 25 != 0) tl = short_scale_length;
-
-        // Recalculate coords incase tick lenght changed
-        x0 = sx * (ticks_width + tl) + position_midle_analog;
-        y0 = sy * (ticks_height + tl) + yposition_midle_analog;
-        x1 = sx * ticks_width + position_midle_analog;
-        y1 = sy * ticks_height + yposition_midle_analog;
-
-        // Draw tick
-        M5.Lcd.drawLine(x0, y0, x1, y1, TFT_BLACK);
-
-        // Check if labels should be drawn, with position tweaks
-        if (i % 25 == 0) {
-            // Calculate label positions
-            x0 = sx * (ticks_width + tl + 10) + position_midle_analog;
-            y0 = sy * (ticks_height + tl + 10) + yposition_midle_analog;
-            switch (i / 25) {
-                case -2:
-                    M5.Lcd.drawCentreString("30", x0, y0 - 12, 2);
-                    break;
-                case -1:
-                    M5.Lcd.drawCentreString("50", x0, y0 - 9, 2);
-                    break;
-                case 0:
-                    M5.Lcd.drawCentreString("70", x0, y0 - 6, 2);
-                    break;
-                case 1:
-                    M5.Lcd.drawCentreString("90", x0, y0 - 9, 2);
-                    break;
-                case 2:
-                    M5.Lcd.drawCentreString("110", x0, y0 - 12, 2);
-                    break;
-            }
-        }
-
-        // Now draw the arc of the scale
-        sx = cos((i + 5 - 90) * DEGTORAD);
-        sy = sin((i + 5 - 90) * DEGTORAD);
-        x0 = sx * ticks_width + position_midle_analog;
-        y0 = sy * ticks_height + yposition_midle_analog;
-        // Draw scale arc, don't draw the last part
-        if (i < 50) M5.Lcd.drawLine(x0, y0, x1, y1, TFT_BLACK);
-    }
-    M5.Lcd.setTextFont(2);
-    M5.Lcd.setTextDatum(BR_DATUM);
-    M5.Lcd.drawString("dB(A)", width - border, height / 2);  
-    
-    M5.Lcd.setTextFont(4);
-    M5.Lcd.setTextDatum(MC_DATUM);
-    M5.Lcd.drawString("dB(A)", width / 2, height / 2);
-    M5.Lcd.drawRect(pos_x + border, pos_y + border, width - border * 2, height - border * 2, TFT_BLACK);  // Draw bezel line
-
-    plotNeedle(tft_settings.tft_height, tft_settings.tft_width, 0, 0);  // Put meter needle at 0
-}
-
-// #########################################################################
-// Update needle position
-// This function is blocking while needle moves, time depends on ms_delay
-// 10ms minimises needle flicker if text is drawn within needle sweep area
-// Smaller values OK if text not in sweep area, zero for instant movement but
-// does not look realistic... (note: 100 increments for full scale deflection)
-// #########################################################################
-void plotNeedle(int width, int height, int value, byte ms_delay) {
-
-    int border = 3;
-    int ticks_width = (width - border * 2) * 0.4 - 2;
-    int ticks_height = (height - border * 2) / 2 - 2;
-    int position_midle_analog = width * 0.5;
-    int yposition_midle_analog = height * 0.8;
-    int long_scale_length = 30;
-    int short_scale_length = 16;
-
-
-    M5.Lcd.setTextColor(TFT_BLACK, TFT_WHITE);
-    char buf[40];
-    sprintf(buf, "RMS: %d   ", display_rms);
-    M5.Lcd.setTextFont(2);
-    M5.Lcd.setTextDatum(BL_DATUM);
-    M5.Lcd.drawString(buf, border * 2, height * 0.6);
-    sprintf(buf, "SPL: %.1f dB", display_dbspl);
-    M5.Lcd.drawString(buf, border * 2, height * 0.6 + 20);
-
-    if (value < MIN_VALUE - 10) value = MIN_VALUE - 10;  // Limit value to emulate needle end stops
-    if (value > MAX_VALUE + 10) value = MAX_VALUE + 10;
-
-    // Move the needle util new value reached
-    while (!(value == old_analog)) {
-        if (old_analog < value)
-            old_analog++;
-        else
-            old_analog--;
-
-        if (ms_delay == 0)
-            old_analog = value;  // Update immediately id delay is 0
-
-        float sdeg =
-            map(old_analog, MIN_VALUE - 10, MAX_VALUE + 10, -150, -30);  // Map value to angle
-        // Calcualte tip of needle coords
-        float sx = cos(sdeg * DEGTORAD);
-        float sy = sin(sdeg * DEGTORAD);
-
-        // Calculate x delta of needle start (does not start at pivot point)
-        float tx = tan((sdeg + 90) * DEGTORAD);
-
-        // Erase old needle image
-        M5.Lcd.drawLine(position_midle_analog - 1, yposition_midle_analog, osx - 1, osy, TFT_WHITE);
-        M5.Lcd.drawLine(position_midle_analog, yposition_midle_analog, osx, osy, TFT_WHITE);
-        M5.Lcd.drawLine(position_midle_analog + 1, yposition_midle_analog, osx + 1, osy, TFT_WHITE);
-
-        // Re-plot text under needle
-        M5.Lcd.setTextColor(TFT_BLACK);
-        M5.Lcd.setTextFont(4);
-        M5.Lcd.setTextDatum(MC_DATUM);
-        M5.Lcd.drawString("dB(A)", width / 2, height / 2);
-
-        // Store new needle end coords for next erase
-        ltx = tx;        
-        osx = sx * ticks_width + position_midle_analog;
-        osy = sy * ticks_height + yposition_midle_analog;
-
-        // Draw the needle in the new postion, magenta makes needle a bit bolder
-        // draws 3 lines to thicken needle
-        //M5.Lcd.drawLine(120 + 20 * ltx - 1, 140 - 20, osx - 1, osy, TFT_RED);
-        M5.Lcd.drawLine(position_midle_analog - 1, yposition_midle_analog, osx - 1, osy, TFT_RED);
-        M5.Lcd.drawLine(position_midle_analog, yposition_midle_analog, osx, osy, TFT_MAGENTA);
-        M5.Lcd.drawLine(position_midle_analog + 1, yposition_midle_analog, osx + 1, osy, TFT_RED);
-
-        // Slow needle down slightly as it approaches new postion
-        if (abs(old_analog - value) < 10) ms_delay += ms_delay / 5;
-
-        // Wait before next update
-        delay(ms_delay);
+    for (int n = 0; n < SIGNAL_LENGTH; n++) {
+        adcBuffer[n] = (double)stereoSamples[n * 2] - mean;
+        vImag[n]     = 0.0;
     }
 
+    // 3. Compute FFT
+    FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
+    FFT.compute(FFTDirection::Forward);
+    FFT.complexToMagnitude();
+
+    // 4. Stable frequency tracking
+    double rawPeak = getCleanPeakFrequency();
+    if (fabs(rawPeak - smoothedFreq) > 80.0) {
+        smoothedFreq = rawPeak;
+    } else {
+        smoothedFreq = smoothedFreq * 0.75 + rawPeak * 0.25;
+    }
+
+    // 5. Calculate max dB level for the header
+    int maxAmplitudeDB = -100;
+    for (int n = 1; n < SIGNAL_LENGTH / 2; n++) {
+        double amp = adcBuffer[n] / (SIGNAL_LENGTH / 2.0);
+        int a = (amp > 1.0) ? (int)(20.0 * log10(amp)) : -100;
+        if (a > maxAmplitudeDB) maxAmplitudeDB = a;
+    }
+
+    // 6. SLIDE SPECTROGRAM LEFT BY 1 PIXEL
+    spectrogram.scroll(-1, 0);
+
+    // 7. Draw the new spectrum column at the far right edge (x = 319)
+    // y = 0 is top (MAX_DISPLAY_FREQ), y = SPECTROGRAM_HEIGHT - 1 is bottom (0 Hz)
+    for (int y = 0; y < SPECTROGRAM_HEIGHT; y++) {
+        double freq = (SPECTROGRAM_HEIGHT - 1 - y) * ((double)MAX_DISPLAY_FREQ / SPECTROGRAM_HEIGHT);
+        int bin = (int)((freq / SAMPLINGFREQUENCY) * SIGNAL_LENGTH);
+        bin = constrain(bin, 1, (SIGNAL_LENGTH / 2) - 1);
+
+        double amplitude = adcBuffer[bin] / (SIGNAL_LENGTH / 2.0);
+        int dB = (amplitude > 1.0) ? (int)(20.0 * log10(amplitude)) : 0;
+
+        // Map noise intensity: 10 dB (silence/Black) to 45 dB (loudest/Hot Pink)
+        int colorIdx = map(dB, 10, 45, 0, 255);
+        colorIdx = constrain(colorIdx, 0, 255);
+
+        spectrogram.drawPixel(SPECTROGRAM_WIDTH - 1, y, colorLUT[colorIdx]);
+    }
+
+    // 8. Push the updated scrolling spectrogram to the display
+    spectrogram.pushSprite(0, HEADER_HEIGHT);
+
+    // 9. Update the top header info bar
+    M5.Display.fillRect(170, 0, 150, HEADER_HEIGHT, 0x18C3);
+    M5.Display.setTextColor(TFT_WHITE, 0x18C3);
+    M5.Display.setTextSize(2);
+    M5.Display.setCursor(175, 4);
+    if (smoothedFreq > 50.0) {
+        M5.Display.printf("%4.0f Hz", smoothedFreq);
+    } else {
+        M5.Display.print("---- Hz");
+    }
+    M5.Display.setCursor(175, 20);
+    M5.Display.setTextSize(1);
+    M5.Display.printf("Peak Level: %2d dB", maxAmplitudeDB);
 }
