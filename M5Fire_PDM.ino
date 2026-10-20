@@ -1,96 +1,201 @@
 #include <M5Unified.h>
-#include <arduinoFFT.h> // Install the arduinoFFT library v2.0.4 from https://github.com/kosme/arduinoFFT 
-#include <driver/i2s_pdm.h>
+#include <arduinoFFT.h>
+#include <esp_adc/adc_continuous.h>
 #include <math.h>
 
-// Left side of the Fire with the M5 Grove PDM Mic plugged
-#define GROVE_B_PIN_CLK   22 
-#define GROVE_B_PIN_DATA  21 
+// ============================================================================
+// USER CONFIGURATION: Sampling frequency for Continuous ADC
+// Supported on ESP32 ADC1: 20000 Hz to 80000+ Hz (44100 or 32000)
+// ============================================================================
+#define SAMPLINGFREQUENCY     44100  // Choose: 44100 or 32000
 
+// Internal analog microphone pin on M5Stack Fire
+#define INTERNAL_MIC_PIN      34     // ADC1 Channel 6
+#define INTERNAL_MIC_CHANNEL  ADC_CHANNEL_6
+
+#define SIGNAL_LENGTH         1024
+#define F_MIN                 1000.0f  // 1 kHz
+#define F_MAX                 16000.0f // 16 kHz
+
+// Display Dimensions
 #define SCREEN_WIDTH          320
 #define SCREEN_HEIGHT         240
-#define HEADER_HEIGHT         38
-#define SPECTROGRAM_HEIGHT    (SCREEN_HEIGHT - HEADER_HEIGHT) // 202 pixels
-#define SPECTROGRAM_WIDTH     SCREEN_WIDTH                    // 320 pixels
+#define HEADER_HEIGHT         34
 
-#define SIGNAL_LENGTH         512
-#define SAMPLINGFREQUENCY     16000
-#define MAX_DISPLAY_FREQ      6000  // 0 to 6000 Hz vertical range
+#define AXIS_WIDTH            40
+#define SPECTROGRAM_WIDTH     (SCREEN_WIDTH - AXIS_WIDTH)     // 280 pixels
+#define SPECTROGRAM_HEIGHT    (SCREEN_HEIGHT - HEADER_HEIGHT) // 206 pixels
 
-// FFT buffers
-int16_t stereoSamples[SIGNAL_LENGTH * 2];
+// ADC Raw Buffer & FFT Buffers
+int16_t adcRawSamples[SIGNAL_LENGTH];
 double adcBuffer[SIGNAL_LENGTH];
 double vImag[SIGNAL_LENGTH];
 
 ArduinoFFT<double> FFT = ArduinoFFT<double>(adcBuffer, vImag, SIGNAL_LENGTH, SAMPLINGFREQUENCY);
 
-// I2S Channel Handle
-i2s_chan_handle_t rx_chan = NULL;
+// Renamed and made static to avoid conflict with Arduino core's internal adc_handle
+static adc_continuous_handle_t mic_adc_handle = NULL;
 
-// In-memory Canvas for fast hardware scrolling
 M5Canvas spectrogram(&M5.Display);
-
-// 256-level Black -> Purple -> Magenta -> Pink color lookup table
 uint16_t colorLUT[256];
 
-void initColorMap() {
-    for (int i = 0; i < 256; i++) {
-        float t = i / 255.0f;
-        uint8_t r = 0, g = 0, b = 0;
+// Precomputed log-Y to FFT bin interpolation table
+struct YMap {
+    int b0;
+    int b1;
+    float frac;
+};
+YMap yMap[SPECTROGRAM_HEIGHT];
 
-        if (t < 0.25f) {
-            // Level 0..63: Black (0,0,0) -> Deep Purple (70,0,90)
-            float f = t / 0.25f;
-            r = (uint8_t)(70 * f);
-            g = 0;
-            b = (uint8_t)(90 * f);
-        } else if (t < 0.50f) {
-            // Level 64..127: Deep Purple -> Magenta (170,10,140)
-            float f = (t - 0.25f) / 0.25f;
-            r = (uint8_t)(70 + (170 - 70) * f);
-            g = (uint8_t)(10 * f);
-            b = (uint8_t)(90 + (140 - 90) * f);
-        } else if (t < 0.75f) {
-            // Level 128..191: Magenta -> Hot Pink (255,50,170)
-            float f = (t - 0.50f) / 0.25f;
-            r = (uint8_t)(170 + (255 - 170) * f);
-            g = (uint8_t)(10 + (50 - 10) * f);
-            b = (uint8_t)(140 + (170 - 140) * f);
+// Full ISO 266 1/3-Octave table from 1 kHz to 16 kHz
+struct ThirdOctave {
+    float freq;
+    const char* label;
+    bool isFullOctave;
+};
+
+const ThirdOctave allThirdOctaves[] = {
+    { 1000.0f,  "1k",    true  }, // Hidden bottom mark
+    { 1250.0f,  "1.2k",  false },
+    { 1600.0f,  "1.6k",  false },
+    { 2000.0f,  "2k",    true  },
+    { 2500.0f,  "2.5k",  false },
+    { 3150.0f,  "3.1k",  false },
+    { 4000.0f,  "4k",    true  },
+    { 5000.0f,  "5k",    false },
+    { 6300.0f,  "6.3k",  false },
+    { 8000.0f,  "8k",    true  },
+    { 10000.0f, "10k",   false },
+    { 12500.0f, "12.5k", false },
+    { 16000.0f, "16k",   true  }  // Hidden top mark
+};
+const int TOTAL_OCTAVES = sizeof(allThirdOctaves) / sizeof(allThirdOctaves[0]);
+
+int sensitivity_dB = 0;
+
+// NoiseCapture Color Palette (17 anchor colors)
+struct RGB {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+};
+
+const RGB noiseCapturePalette[17] = {
+    { 0x30, 0x30, 0x30 }, { 0x2D, 0x3C, 0x2D }, { 0x2A, 0x48, 0x2A },
+    { 0x27, 0x54, 0x27 }, { 0x24, 0x60, 0x24 }, { 0x21, 0x6C, 0x21 },
+    { 0x3F, 0x8E, 0x19 }, { 0x61, 0xA5, 0x14 }, { 0x82, 0xBB, 0x0F },
+    { 0xA4, 0xD2, 0x0A }, { 0xC5, 0xE8, 0x05 }, { 0xE7, 0xFF, 0x00 },
+    { 0xEB, 0xD4, 0x00 }, { 0xEF, 0xAA, 0x00 }, { 0xF3, 0x7F, 0x00 },
+    { 0xF7, 0x55, 0x00 }, { 0xFB, 0x2A, 0x00 }
+};
+
+void initColorMap() {
+    const int numColors = 17;
+    for (int i = 0; i < 256; i++) {
+        float pos = (i / 255.0f) * (numColors - 1);
+        int idx = (int)pos;
+        float frac = pos - idx;
+
+        if (idx >= numColors - 1) {
+            colorLUT[i] = M5.Display.color565(noiseCapturePalette[numColors - 1].r,
+                                              noiseCapturePalette[numColors - 1].g,
+                                              noiseCapturePalette[numColors - 1].b);
         } else {
-            // Level 192..255: Hot Pink -> Luminous Pastel Pink (255,180,225)
-            float f = (t - 0.75f) / 0.25f;
-            r = 255;
-            g = (uint8_t)(50 + (180 - 50) * f);
-            b = (uint8_t)(170 + (225 - 170) * f);
+            uint8_t r = (uint8_t)((1.0f - frac) * noiseCapturePalette[idx].r + frac * noiseCapturePalette[idx + 1].r);
+            uint8_t g = (uint8_t)((1.0f - frac) * noiseCapturePalette[idx].g + frac * noiseCapturePalette[idx + 1].g);
+            uint8_t b = (uint8_t)((1.0f - frac) * noiseCapturePalette[idx].b + frac * noiseCapturePalette[idx + 1].b);
+            colorLUT[i] = M5.Display.color565(r, g, b);
         }
-        colorLUT[i] = M5.Display.color565(r, g, b);
     }
 }
 
-bool init_pdm() {
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    if (i2s_new_channel(&chan_cfg, NULL, &rx_chan) != ESP_OK) return false;
+void initLogFrequencyMap() {
+    for (int y = 0; y < SPECTROGRAM_HEIGHT; y++) {
+        float norm_y = (float)(SPECTROGRAM_HEIGHT - 1 - y) / (float)(SPECTROGRAM_HEIGHT - 1);
+        float freq = F_MIN * powf(F_MAX / F_MIN, norm_y);
 
-    i2s_pdm_rx_config_t pdm_rx_cfg = {
-        .clk_cfg  = I2S_PDM_RX_CLK_DEFAULT_CONFIG(SAMPLINGFREQUENCY),
-        .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = {
-            .clk = (gpio_num_t)GROVE_B_PIN_CLK,
-            .din = (gpio_num_t)GROVE_B_PIN_DATA,
-            .invert_flags = { .clk_inv = false },
-        },
-    };
+        float binFloat = (freq / (float)SAMPLINGFREQUENCY) * SIGNAL_LENGTH;
+        binFloat = constrain(binFloat, 1.0f, (float)(SIGNAL_LENGTH / 2 - 2));
 
-    if (i2s_channel_init_pdm_rx_mode(rx_chan, &pdm_rx_cfg) != ESP_OK) return false;
-    return (i2s_channel_enable(rx_chan) == ESP_OK);
+        yMap[y].b0 = (int)binFloat;
+        yMap[y].b1 = yMap[y].b0 + 1;
+        yMap[y].frac = binFloat - yMap[y].b0;
+    }
 }
 
-// Bounded peak detector (ignores DC hum and PDM quantization noise)
+int getScreenY(float freq) {
+    if (freq < F_MIN) freq = F_MIN;
+    if (freq > F_MAX) freq = F_MAX;
+    float norm_y = logf(freq / F_MIN) / logf(F_MAX / F_MIN);
+    int y = (SPECTROGRAM_HEIGHT - 1) - (int)roundf(norm_y * (SPECTROGRAM_HEIGHT - 1));
+    return HEADER_HEIGHT + y;
+}
+
+void drawFrequencyAxis() {
+    M5.Display.fillRect(SPECTROGRAM_WIDTH, HEADER_HEIGHT, AXIS_WIDTH, SPECTROGRAM_HEIGHT, colorLUT[0]);
+    M5.Display.drawFastVLine(SPECTROGRAM_WIDTH, HEADER_HEIGHT, SPECTROGRAM_HEIGHT, 0x4208);
+    M5.Display.setTextSize(1);
+
+    for (int i = 1; i < TOTAL_OCTAVES - 1; i++) {
+        int y_pos = getScreenY(allThirdOctaves[i].freq);
+
+        if (allThirdOctaves[i].isFullOctave) {
+            M5.Display.drawFastHLine(SPECTROGRAM_WIDTH, y_pos, 7, TFT_WHITE);
+            M5.Display.setTextColor(TFT_WHITE, colorLUT[0]);
+            M5.Display.setCursor(SPECTROGRAM_WIDTH + 9, y_pos - 3);
+            M5.Display.print(allThirdOctaves[i].label);
+        } else {
+            M5.Display.drawFastHLine(SPECTROGRAM_WIDTH, y_pos, 4, TFT_WHITE);
+            M5.Display.setTextColor(0xC618, colorLUT[0]);
+            M5.Display.setCursor(SPECTROGRAM_WIDTH + 7, y_pos - 3);
+            M5.Display.print(allThirdOctaves[i].label);
+        }
+    }
+}
+
+// Hardware Continuous DMA ADC Initialization (GPIO 34)
+bool init_internal_adc_mic() {
+    adc_continuous_handle_cfg_t adc_config = {
+        .max_store_buf_size = 4096,
+        .conv_frame_size = SIGNAL_LENGTH * 2, // 2 bytes per conversion on ESP32
+    };
+    esp_err_t err = adc_continuous_new_handle(&adc_config, &mic_adc_handle);
+    if (err != ESP_OK) {
+        Serial.printf("[ERR] adc_continuous_new_handle: 0x%x\n", err);
+        return false;
+    }
+
+    adc_continuous_config_t dig_cfg = {
+        .sample_freq_hz = SAMPLINGFREQUENCY,
+        .conv_mode = ADC_CONV_SINGLE_UNIT_1,
+        .format = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
+    };
+
+    adc_digi_pattern_config_t adc_pattern = {
+        .atten = ADC_ATTEN_DB_12,
+        .channel = INTERNAL_MIC_CHANNEL, // ADC1_CH6 (GPIO 34)
+        .unit = ADC_UNIT_1,
+        .bit_width = SOC_ADC_DIGI_MAX_BITWIDTH,
+    };
+
+    dig_cfg.pattern_num = 1;
+    dig_cfg.adc_pattern = &adc_pattern;
+
+    err = adc_continuous_config(mic_adc_handle, &dig_cfg);
+    if (err != ESP_OK) {
+        Serial.printf("[ERR] adc_continuous_config: 0x%x\n", err);
+        return false;
+    }
+
+    err = adc_continuous_start(mic_adc_handle);
+    return (err == ESP_OK);
+}
+
 double getCleanPeakFrequency() {
     double maxY = 0;
     int maxBin = 0;
-    int minBin = 3; // ~94 Hz
-    int maxBinLimit = (int)((MAX_DISPLAY_FREQ / (double)SAMPLINGFREQUENCY) * SIGNAL_LENGTH);
+    int minBin = (int)((F_MIN * 0.95f / (float)SAMPLINGFREQUENCY) * SIGNAL_LENGTH);
+    int maxBinLimit = (int)((F_MAX * 1.02f / (double)SAMPLINGFREQUENCY) * SIGNAL_LENGTH);
 
     for (int i = minBin; i <= maxBinLimit; i++) {
         if (adcBuffer[i] > maxY) {
@@ -116,46 +221,78 @@ void setup() {
     cfg.internal_mic    = false;
     M5.begin(cfg);
 
-    initColorMap();
-    init_pdm();
+    Serial.println("\n========================================");
+    Serial.printf ("  Internal Analog Mic (GPIO 34) @ %d Hz\n", SAMPLINGFREQUENCY);
+    Serial.printf ("  Range: %.0f Hz - %.0f Hz\n", F_MIN, F_MAX);
+    Serial.println("========================================");
 
-    // Create the off-screen canvas for the scrolling waterfall
+    initColorMap();
+    initLogFrequencyMap();
+    
+    bool ok = init_internal_adc_mic();
+    Serial.printf("[INIT] Continuous ADC DMA: %s\n", ok ? "ONLINE" : "FAILED");
+
     spectrogram.setColorDepth(16);
     spectrogram.createSprite(SPECTROGRAM_WIDTH, SPECTROGRAM_HEIGHT);
-    spectrogram.fillSprite(TFT_BLACK);
+    spectrogram.fillSprite(colorLUT[0]);
 
-    // Initial display frame
-    M5.Display.fillScreen(TFT_BLACK);
-    M5.Display.fillRect(0, 0, SCREEN_WIDTH, HEADER_HEIGHT, 0x18C3); // Dark slate header
-    M5.Display.setTextColor(TFT_WHITE, 0x18C3);
-    M5.Display.setTextSize(1);
-    M5.Display.setCursor(6, 4);
-    M5.Display.print("SPECTROGRAM (0 - 6 kHz)");
-    M5.Display.setCursor(6, 20);
-    M5.Display.print("Time -> (Sliding Left)");
+    M5.Display.fillScreen(colorLUT[0]);
+    drawFrequencyAxis();
 }
 
 double smoothedFreq = 0.0;
 
 void loop(void) {
     M5.update();
-    if (!rx_chan) return;
 
-    // 1. Read DMA stereo samples
-    size_t bytes_read = 0;
-    esp_err_t err = i2s_channel_read(rx_chan, (void *)stereoSamples, sizeof(stereoSamples), &bytes_read, 1000 / portTICK_PERIOD_MS);
+    if (M5.BtnA.wasPressed()) {
+        sensitivity_dB -= 3;
+        if (sensitivity_dB < -24) sensitivity_dB = -24;
+    }
+    if (M5.BtnB.wasPressed()) {
+        sensitivity_dB = 0;
+    }
+    if (M5.BtnC.wasPressed()) {
+        sensitivity_dB += 3;
+        if (sensitivity_dB > 36) sensitivity_dB = 36;
+    }
+
+    if (!mic_adc_handle) return;
+
+    // 1. Read DMA buffer from Continuous ADC
+    uint8_t dmaRawBytes[SIGNAL_LENGTH * 2];
+    uint32_t bytes_read = 0;
+    esp_err_t err = adc_continuous_read(mic_adc_handle, dmaRawBytes, sizeof(dmaRawBytes), &bytes_read, 1000 / portTICK_PERIOD_MS);
     if (err != ESP_OK || bytes_read == 0) return;
 
-    // 2. Lock to Left channel & remove DC bias
-    int64_t sum = 0;
-    for (int n = 0; n < SIGNAL_LENGTH; n++) {
-        sum += stereoSamples[n * 2];
+    // 2. Parse 12-bit ADC data (Type 1 format) & remove DC bias (~2048)
+    int32_t sum = 0;
+    int16_t peakRawSample = 0;
+
+    for (int i = 0; i < SIGNAL_LENGTH; i++) {
+        adc_digi_output_data_t *p = (adc_digi_output_data_t *)&dmaRawBytes[i * 2];
+        int16_t val = (int16_t)(p->type1.data); // 12-bit reading (0 to 4095)
+        adcRawSamples[i] = val;
+        sum += val;
     }
+
     double mean = (double)sum / SIGNAL_LENGTH;
 
     for (int n = 0; n < SIGNAL_LENGTH; n++) {
-        adcBuffer[n] = (double)stereoSamples[n * 2] - mean;
+        double centered = (double)adcRawSamples[n] - mean;
+        adcBuffer[n] = centered;
         vImag[n]     = 0.0;
+        if (abs((int)centered) > peakRawSample) peakRawSample = abs((int)centered);
+    }
+
+    // 12-bit full scale is 2048
+    double overall_dBFS = (peakRawSample > 0) ? 20.0 * log10((double)peakRawSample / 2048.0) : -96.0;
+
+    static uint32_t lastDebug = 0;
+    if (millis() - lastDebug > 1000) {
+        lastDebug = millis();
+        Serial.printf("[DEBUG] Raw Mean: %4.0f (Bias ~2048) | Peak Dev: %4d | dBFS: %3.0f\n", 
+                      mean, peakRawSample, overall_dBFS);
     }
 
     // 3. Compute FFT
@@ -165,54 +302,61 @@ void loop(void) {
 
     // 4. Stable frequency tracking
     double rawPeak = getCleanPeakFrequency();
-    if (fabs(rawPeak - smoothedFreq) > 80.0) {
+    if (fabs(rawPeak - smoothedFreq) > (F_MAX * 0.015f)) {
         smoothedFreq = rawPeak;
     } else {
         smoothedFreq = smoothedFreq * 0.75 + rawPeak * 0.25;
     }
 
-    // 5. Calculate max dB level for the header
-    int maxAmplitudeDB = -100;
-    for (int n = 1; n < SIGNAL_LENGTH / 2; n++) {
-        double amp = adcBuffer[n] / (SIGNAL_LENGTH / 2.0);
-        int a = (amp > 1.0) ? (int)(20.0 * log10(amp)) : -100;
-        if (a > maxAmplitudeDB) maxAmplitudeDB = a;
+    // 5. Tone dBFS calculation
+    double tone_dBFS = -96.0;
+    int peakBin = (int)roundf((smoothedFreq / (float)SAMPLINGFREQUENCY) * SIGNAL_LENGTH);
+    if (peakBin >= 1 && peakBin < (SIGNAL_LENGTH / 2)) {
+        double toneAmp = adcBuffer[peakBin] / (SIGNAL_LENGTH / 2.0);
+        if (toneAmp > 1.0) {
+            tone_dBFS = 20.0 * log10(toneAmp / 2048.0);
+        }
     }
 
-    // 6. SLIDE SPECTROGRAM LEFT BY 1 PIXEL
+    // 6. Slide spectrogram left by 1 pixel
     spectrogram.scroll(-1, 0);
 
-    // 7. Draw the new spectrum column at the far right edge (x = 319)
-    // y = 0 is top (MAX_DISPLAY_FREQ), y = SPECTROGRAM_HEIGHT - 1 is bottom (0 Hz)
+    // 7. Render new column with NoiseCapture color gradient
     for (int y = 0; y < SPECTROGRAM_HEIGHT; y++) {
-        double freq = (SPECTROGRAM_HEIGHT - 1 - y) * ((double)MAX_DISPLAY_FREQ / SPECTROGRAM_HEIGHT);
-        int bin = (int)((freq / SAMPLINGFREQUENCY) * SIGNAL_LENGTH);
-        bin = constrain(bin, 1, (SIGNAL_LENGTH / 2) - 1);
+        double amp0 = adcBuffer[yMap[y].b0];
+        double amp1 = adcBuffer[yMap[y].b1];
+        double amp = (1.0f - yMap[y].frac) * amp0 + yMap[y].frac * amp1;
+        amp /= (SIGNAL_LENGTH / 2.0);
 
-        double amplitude = adcBuffer[bin] / (SIGNAL_LENGTH / 2.0);
-        int dB = (amplitude > 1.0) ? (int)(20.0 * log10(amplitude)) : 0;
+        double pix_dBFS = (amp > 1.0) ? 20.0 * log10(amp / 2048.0) : -96.0;
+        double adjusted_dBFS = pix_dBFS + sensitivity_dB;
 
-        // Map noise intensity: 10 dB (silence/Black) to 45 dB (loudest/Hot Pink)
-        int colorIdx = map(dB, 10, 45, 0, 255);
-        colorIdx = constrain(colorIdx, 0, 255);
-
+        // Map -60 dBFS to -10 dBFS
+        int colorIdx = constrain(map((int)adjusted_dBFS, -60, -10, 0, 255), 0, 255);
         spectrogram.drawPixel(SPECTROGRAM_WIDTH - 1, y, colorLUT[colorIdx]);
     }
 
-    // 8. Push the updated scrolling spectrogram to the display
+    // 8. Push to screen
     spectrogram.pushSprite(0, HEADER_HEIGHT);
 
-    // 9. Update the top header info bar
-    M5.Display.fillRect(170, 0, 150, HEADER_HEIGHT, 0x18C3);
-    M5.Display.setTextColor(TFT_WHITE, 0x18C3);
-    M5.Display.setTextSize(2);
-    M5.Display.setCursor(175, 4);
-    if (smoothedFreq > 50.0) {
-        M5.Display.printf("%4.0f Hz", smoothedFreq);
-    } else {
-        M5.Display.print("---- Hz");
-    }
-    M5.Display.setCursor(175, 20);
+    // 9. Update header bar
+    M5.Display.fillRect(0, 0, SCREEN_WIDTH, HEADER_HEIGHT, 0x10A2);
+
+    M5.Display.setTextColor(TFT_WHITE, 0x10A2);
     M5.Display.setTextSize(1);
-    M5.Display.printf("Peak Level: %2d dB", maxAmplitudeDB);
+    M5.Display.setCursor(6, 4);
+    M5.Display.printf("INTERNAL MIC (GPIO 34 @ %d)", (int)SAMPLINGFREQUENCY);
+    M5.Display.setCursor(6, 18);
+    M5.Display.printf("Peak: %3.0f dBFS | Sens: %+ddB", overall_dBFS, sensitivity_dB);
+
+    M5.Display.setCursor(185, 2);
+    M5.Display.setTextSize(2);
+    if (smoothedFreq >= (F_MIN * 0.95f)) {
+        M5.Display.printf("%5.0f Hz", smoothedFreq);
+    } else {
+        M5.Display.print("----- Hz");
+    }
+    M5.Display.setTextSize(1);
+    M5.Display.setCursor(185, 20);
+    M5.Display.printf("Tone: %3.0f dBFS", tone_dBFS);
 }
