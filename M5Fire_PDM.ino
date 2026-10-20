@@ -4,18 +4,19 @@
 #include <math.h>
 
 // ============================================================================
-// USER CONFIGURATION: Sampling frequency for Continuous ADC
-// Supported on ESP32 ADC1: 20000 Hz to 80000+ Hz (44100 or 32000)
+// CONFIGURATION: 44.1 kHz Continuous ADC (Nyquist = 22.05 kHz)
 // ============================================================================
-#define SAMPLINGFREQUENCY     44100  // Choose: 44100 or 32000
+#define SAMPLINGFREQUENCY     44100
 
 // Internal analog microphone pin on M5Stack Fire
 #define INTERNAL_MIC_PIN      34     // ADC1 Channel 6
 #define INTERNAL_MIC_CHANNEL  ADC_CHANNEL_6
 
 #define SIGNAL_LENGTH         1024
-#define F_MIN                 1000.0f  // 1 kHz
-#define F_MAX                 16000.0f // 16 kHz
+
+// Frequency range extended to Nyquist (44.1 kHz / 2 = 22050 Hz)
+#define F_MIN                 500.0f
+#define F_MAX                 (SAMPLINGFREQUENCY / 2.0f) // 22050.0 Hz
 
 // Display Dimensions
 #define SCREEN_WIDTH          320
@@ -33,7 +34,7 @@ double vImag[SIGNAL_LENGTH];
 
 ArduinoFFT<double> FFT = ArduinoFFT<double>(adcBuffer, vImag, SIGNAL_LENGTH, SAMPLINGFREQUENCY);
 
-// Renamed and made static to avoid conflict with Arduino core's internal adc_handle
+// Static handle avoids linker conflicts with Arduino core's internal adc_handle
 static adc_continuous_handle_t mic_adc_handle = NULL;
 
 M5Canvas spectrogram(&M5.Display);
@@ -47,7 +48,7 @@ struct YMap {
 };
 YMap yMap[SPECTROGRAM_HEIGHT];
 
-// Full ISO 266 1/3-Octave table from 1 kHz to 16 kHz
+// ISO 266 1/3-Octave table up to Nyquist
 struct ThirdOctave {
     float freq;
     const char* label;
@@ -55,7 +56,10 @@ struct ThirdOctave {
 };
 
 const ThirdOctave allThirdOctaves[] = {
-    { 1000.0f,  "1k",    true  }, // Hidden bottom mark
+    { 500.0f,   "500",   true  }, // Hidden bottom boundary
+    { 630.0f,   "630",   false },
+    { 800.0f,   "800",   false },
+    { 1000.0f,  "1k",    true  }, // Visible full octave
     { 1250.0f,  "1.2k",  false },
     { 1600.0f,  "1.6k",  false },
     { 2000.0f,  "2k",    true  },
@@ -67,7 +71,9 @@ const ThirdOctave allThirdOctaves[] = {
     { 8000.0f,  "8k",    true  },
     { 10000.0f, "10k",   false },
     { 12500.0f, "12.5k", false },
-    { 16000.0f, "16k",   true  }  // Hidden top mark
+    { 16000.0f, "16k",   true  },
+    { 20000.0f, "20k",   false },
+    { 22050.0f, "22k",   true  }  // Hidden top boundary
 };
 const int TOTAL_OCTAVES = sizeof(allThirdOctaves) / sizeof(allThirdOctaves[0]);
 
@@ -136,6 +142,7 @@ void drawFrequencyAxis() {
     M5.Display.drawFastVLine(SPECTROGRAM_WIDTH, HEADER_HEIGHT, SPECTROGRAM_HEIGHT, 0x4208);
     M5.Display.setTextSize(1);
 
+    // Skip the first index (500) and last index (22k) to avoid text truncation
     for (int i = 1; i < TOTAL_OCTAVES - 1; i++) {
         int y_pos = getScreenY(allThirdOctaves[i].freq);
 
@@ -153,11 +160,10 @@ void drawFrequencyAxis() {
     }
 }
 
-// Hardware Continuous DMA ADC Initialization (GPIO 34)
 bool init_internal_adc_mic() {
     adc_continuous_handle_cfg_t adc_config = {
         .max_store_buf_size = 4096,
-        .conv_frame_size = SIGNAL_LENGTH * 2, // 2 bytes per conversion on ESP32
+        .conv_frame_size = SIGNAL_LENGTH * 2, // 2 bytes per sample on ESP32
     };
     esp_err_t err = adc_continuous_new_handle(&adc_config, &mic_adc_handle);
     if (err != ESP_OK) {
@@ -195,7 +201,7 @@ double getCleanPeakFrequency() {
     double maxY = 0;
     int maxBin = 0;
     int minBin = (int)((F_MIN * 0.95f / (float)SAMPLINGFREQUENCY) * SIGNAL_LENGTH);
-    int maxBinLimit = (int)((F_MAX * 1.02f / (double)SAMPLINGFREQUENCY) * SIGNAL_LENGTH);
+    int maxBinLimit = (int)((F_MAX * 0.99f / (double)SAMPLINGFREQUENCY) * SIGNAL_LENGTH);
 
     for (int i = minBin; i <= maxBinLimit; i++) {
         if (adcBuffer[i] > maxY) {
@@ -223,7 +229,7 @@ void setup() {
 
     Serial.println("\n========================================");
     Serial.printf ("  Internal Analog Mic (GPIO 34) @ %d Hz\n", SAMPLINGFREQUENCY);
-    Serial.printf ("  Range: %.0f Hz - %.0f Hz\n", F_MIN, F_MAX);
+    Serial.printf ("  Range: %.0f Hz - %.1f kHz (Nyquist)\n", F_MIN, F_MAX / 1000.0f);
     Serial.println("========================================");
 
     initColorMap();
@@ -265,13 +271,13 @@ void loop(void) {
     esp_err_t err = adc_continuous_read(mic_adc_handle, dmaRawBytes, sizeof(dmaRawBytes), &bytes_read, 1000 / portTICK_PERIOD_MS);
     if (err != ESP_OK || bytes_read == 0) return;
 
-    // 2. Parse 12-bit ADC data (Type 1 format) & remove DC bias (~2048)
+    // 2. Parse 12-bit ADC data & remove DC bias (~2048)
     int32_t sum = 0;
     int16_t peakRawSample = 0;
 
     for (int i = 0; i < SIGNAL_LENGTH; i++) {
         adc_digi_output_data_t *p = (adc_digi_output_data_t *)&dmaRawBytes[i * 2];
-        int16_t val = (int16_t)(p->type1.data); // 12-bit reading (0 to 4095)
+        int16_t val = (int16_t)(p->type1.data);
         adcRawSamples[i] = val;
         sum += val;
     }
@@ -285,13 +291,12 @@ void loop(void) {
         if (abs((int)centered) > peakRawSample) peakRawSample = abs((int)centered);
     }
 
-    // 12-bit full scale is 2048
     double overall_dBFS = (peakRawSample > 0) ? 20.0 * log10((double)peakRawSample / 2048.0) : -96.0;
 
     static uint32_t lastDebug = 0;
     if (millis() - lastDebug > 1000) {
         lastDebug = millis();
-        Serial.printf("[DEBUG] Raw Mean: %4.0f (Bias ~2048) | Peak Dev: %4d | dBFS: %3.0f\n", 
+        Serial.printf("[DEBUG] Raw Mean: %4.0f | Peak Dev: %4d | dBFS: %3.0f\n", 
                       mean, peakRawSample, overall_dBFS);
     }
 
@@ -331,7 +336,6 @@ void loop(void) {
         double pix_dBFS = (amp > 1.0) ? 20.0 * log10(amp / 2048.0) : -96.0;
         double adjusted_dBFS = pix_dBFS + sensitivity_dB;
 
-        // Map -60 dBFS to -10 dBFS
         int colorIdx = constrain(map((int)adjusted_dBFS, -60, -10, 0, 255), 0, 255);
         spectrogram.drawPixel(SPECTROGRAM_WIDTH - 1, y, colorLUT[colorIdx]);
     }
@@ -345,7 +349,7 @@ void loop(void) {
     M5.Display.setTextColor(TFT_WHITE, 0x10A2);
     M5.Display.setTextSize(1);
     M5.Display.setCursor(6, 4);
-    M5.Display.printf("INTERNAL MIC (GPIO 34 @ %d)", (int)SAMPLINGFREQUENCY);
+    M5.Display.printf("INTERNAL MIC (0.5k-%.1fk)", F_MAX / 1000.0f);
     M5.Display.setCursor(6, 18);
     M5.Display.printf("Peak: %3.0f dBFS | Sens: %+ddB", overall_dBFS, sensitivity_dB);
 
