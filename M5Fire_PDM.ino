@@ -65,16 +65,6 @@ struct ThirdOctave {
     bool isFullOctave;
 };
 
-const float thirdOctaveBands[] = {
-    20.0f, 25.0f, 31.5f, 40.0f, 50.0f, 63.0f, 80.0f, 100.0f, 125.0f, 160.0f,
-    200.0f, 250.0f, 315.0f, 400.0f, 500.0f, 630.0f, 800.0f, 1000.0f, 1250.0f,
-    1600.0f, 2000.0f, 2500.0f, 3150.0f, 4000.0f, 5000.0f, 6300.0f, 8000.0f,
-    10000.0f, 12500.0f, 16000.0f
-};
-const int NUM_THIRD_OCTAVE_BANDS = sizeof(thirdOctaveBands) / sizeof(thirdOctaveBands[0]);
-int bandBinIndices[NUM_THIRD_OCTAVE_BANDS][2];  // [start_bin, end_bin] for each band
-int bandToY[NUM_THIRD_OCTAVE_BANDS];  // Vertical position for each band
-
 const ThirdOctave allThirdOctaves[] = {
     { 200.0f,   "200",   false },
     { 250.0f,   "250",   true  },
@@ -589,58 +579,25 @@ void renderSpectrogramColumn() {
     double fullScale = (activeMic == MIC_EXTERNAL_PDM) ? 32768.0 : 2048.0 * OVERSAMPLING_FACTOR;
     float currentSens = getCurrentSensitivity();
 
-    // Precompute the dB values for each 1/3-octave band
-    double band_dBA[NUM_THIRD_OCTAVE_BANDS] = {0.0f};
-
-    for (int b = 0; b < NUM_THIRD_OCTAVE_BANDS; b++) {
-        int startBin = bandBinIndices[b][0];
-        int endBin = bandBinIndices[b][1];
-        double sumPower = 0.0f;
-
-        for (int k = startBin; k <= endBin; k++) {
-            double ampNorm = (adcBuffer[k] / (activeSignalLength / 2.0)) / fullScale;
-            sumPower += ampNorm * ampNorm;
-        }
-
-        // Convert summed power to dB
-        if (sumPower > 0.0f) {
-            double dBFS = 10.0f * log10f(sumPower);
-            band_dBA[b] = dBFS - currentSens + 94.0f;  // Apply calibration
-        } else {
-            band_dBA[b] = -96.0f;  // Silence
-        }
-    }
-
-    // Fill all pixels in the column by interpolating between bands
     for (int y = 0; y < SPECTROGRAM_HEIGHT; y++) {
-        // Find the two closest bands for this pixel row
-        int closestBand1 = 0;
-        int closestBand2 = 0;
-        float minDiff1 = 1e6;
-        float minDiff2 = 1e6;
+        // Get the FFT bin range for this pixel's frequency
+        int binStart = yMap[y].b0;
+        int binEnd = yMap[y].b1;
 
-        for (int b = 0; b < NUM_THIRD_OCTAVE_BANDS; b++) {
-            float diff = fabsf(y - bandToY[b]);
-            if (diff < minDiff1) {
-                minDiff2 = minDiff1;
-                closestBand2 = closestBand1;
-                minDiff1 = diff;
-                closestBand1 = b;
-            } else if (diff < minDiff2) {
-                minDiff2 = diff;
-                closestBand2 = b;
-            }
+        // Sum the power of all bins between binStart and binEnd
+        double totalPower = 0.0;
+        for (int bin = binStart; bin <= binEnd; bin++) {
+            double ampNorm = (adcBuffer[bin] / (activeSignalLength / 2.0)) / fullScale;
+            totalPower += ampNorm * ampNorm;  // Sum of squared amplitudes (power)
         }
 
-        // Interpolate dB value between the two closest bands
-        float dB1 = band_dBA[closestBand1];
-        float dB2 = band_dBA[closestBand2];
-        float frac = (y - bandToY[closestBand1]) / (float)(bandToY[closestBand2] - bandToY[closestBand1]);
-        frac = constrain(frac, 0.0f, 1.0f);
-        float interpolated_dB = dB1 + frac * (dB2 - dB1);
+        // Convert total power to dB (full-scale reference)
+        double dBFS = (totalPower > 0.0) ? 10.0 * log10(totalPower) : -96.0;
+        // Apply calibration offset (no A-weighting)
+        double dB = dBFS - currentSens + 94.0;
 
-        // Map to color
-        int colorIdx = constrain((int)((interpolated_dB - 35.0f) * 255.0f / (120.0f - 35.0f)), 0, 255);
+        // Map dB value to color index (35-120 dB range)
+        int colorIdx = constrain((int)((dB - 35.0f) * 255.0f / 85.0f), 0, 255);
         spectrogram.drawPixel(SPECTROGRAM_WIDTH - 1, y, colorLUT[colorIdx]);
     }
 
@@ -680,22 +637,6 @@ void updateHeaderUI() {
     }
 }
 
-void initBandBinIndices() {
-    float binFreqStep = (float)(activeSamplingRate / OVERSAMPLING_FACTOR) / activeSignalLength;
-    for (int b = 0; b < NUM_THIRD_OCTAVE_BANDS; b++) {
-        float lowerFreq = thirdOctaveBands[b] / powf(2.0f, 1.0f / 6.0f);  // Lower bound of the band
-        float upperFreq = thirdOctaveBands[b] * powf(2.0f, 1.0f / 6.0f);  // Upper bound of the band
-        int startBin = (int)(lowerFreq / binFreqStep);
-        int endBin = (int)(upperFreq / binFreqStep);
-        bandBinIndices[b][0] = max(1, startBin);  // Skip bin 0 (DC)
-        bandBinIndices[b][1] = min(activeSignalLength / 2 - 1, endBin);
-    }
-    for (int b = 0; b < NUM_THIRD_OCTAVE_BANDS; b++) {
-        float norm_y = logf(thirdOctaveBands[b] / activeFMin) / logf(activeFMax / activeFMin);
-        bandToY[b] = (SPECTROGRAM_HEIGHT - 1) - (int)roundf(norm_y * (SPECTROGRAM_HEIGHT - 1));
-    }
-}
-
 // ============================================================================
 // MAIN SETUP & LOOP
 // ============================================================================
@@ -708,7 +649,6 @@ void setup() {
 
     loadCalibration();
     initColorMap();
-    initBandBinIndices();
 
     spectrogram.setColorDepth(16);
     spectrogram.createSprite(SPECTROGRAM_WIDTH, SPECTROGRAM_HEIGHT);
