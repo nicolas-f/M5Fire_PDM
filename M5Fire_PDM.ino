@@ -91,14 +91,14 @@ const ThirdOctave allThirdOctaves[] = {
 const int TOTAL_OCTAVES = sizeof(allThirdOctaves) / sizeof(allThirdOctaves[0]);
 
 // Stored Sensitivities
-float target_dBA        = 94.0f;
-float sensitivity_pdm   = -26.0f;
-float sensitivity_int   = -28.0f;
-uint32_t calFlashTimer  = 0;
+float target_dBA = 94.0f;
+float sensitivity_pdm = -26.0f;
+float sensitivity_int = -28.0f;
+uint32_t calFlashTimer = 0;
 
 double fastPowerFiltered = 0.0;
-double currentLaf_dBA    = 0.0;
-double smoothedFreq      = 0.0;
+double currentLaf_dBA = 0.0;
+double smoothedFreq = 0.0;
 
 // NoiseCapture Color Palette
 struct RGB { uint8_t r, g, b; };
@@ -113,7 +113,8 @@ const RGB noiseCapturePalette[17] = {
 
 // Returns active sensitivity based on the selected microphone
 inline float getCurrentSensitivity() {
-    return (activeMic == MIC_EXTERNAL_PDM) ? sensitivity_pdm : sensitivity_int;
+    float sens = (activeMic == MIC_EXTERNAL_PDM) ? sensitivity_pdm : sensitivity_int;
+    return (sens > 0.0f) ? 0.0f : sens;
 }
 
 // ============================================================================
@@ -296,21 +297,21 @@ void configureMicrophoneMode(MicSource source) {
         stopADCDriver();
         if (!rx_chan) startPDMDriver();
 
-        activeMic           = MIC_EXTERNAL_PDM;
-        activeSamplingRate  = 16000;
-        activeSignalLength  = 512;
-        activeFMin          = 250.0f;
-        activeFMax          = 6300.0f;
+        activeMic = MIC_EXTERNAL_PDM;
+        activeSamplingRate = 16000;
+        activeSignalLength = 512;
+        activeFMin = 250.0f;
+        activeFMax = 6300.0f;
         Serial.println("[MODE] Switched to EXTERNAL PDM MIC (Port A @ 16 kHz)");
     } else {
         stopPDMDriver();
         if (!mic_adc_handle) startADCDriver();
 
-        activeMic           = MIC_INTERNAL_ADC;
-        activeSamplingRate  = 44100;
-        activeSignalLength  = 1024;
-        activeFMin          = 500.0f;
-        activeFMax          = 22050.0f;
+        activeMic = MIC_INTERNAL_ADC;
+        activeSamplingRate = 44100;
+        activeSignalLength = 1024;
+        activeFMin = 500.0f;
+        activeFMax = 22050.0f;
         Serial.println("[MODE] Switched to INTERNAL ANALOG MIC (GPIO 34 @ 44.1 kHz)");
     }
 
@@ -326,8 +327,11 @@ void loadCalibration() {
     prefs.begin("sound_cal", true);
     sensitivity_pdm = prefs.getFloat("sens_pdm", -26.0f);
     sensitivity_int = prefs.getFloat("sens_int", -28.0f);
-    target_dBA      = prefs.getFloat("target", 94.0f);
+    target_dBA = prefs.getFloat("target", 94.0f);
     prefs.end();
+
+    if (sensitivity_pdm > 0.0f) sensitivity_pdm = 0.0f;
+    if (sensitivity_int > 0.0f) sensitivity_int = 0.0f;
 }
 
 void saveCalibration() {
@@ -369,7 +373,7 @@ double getCleanPeakFrequency() {
 void handleCalibrationControls() {
     if (M5.BtnA.wasPressed()) {
         target_dBA -= 1.0f;
-        if (target_dBA < 40.0f) target_dBA = 40.0f;
+        if (target_dBA < 25.0f) target_dBA = 25.0f;
     }
     if (M5.BtnB.wasPressed()) {
         target_dBA += 1.0f;
@@ -377,10 +381,14 @@ void handleCalibrationControls() {
     }
     if (M5.BtnC.wasPressed()) {
         double currentFast_dBFS = (fastPowerFiltered > 1e-12) ? 10.0 * log10(fastPowerFiltered) : -96.0;
+        float newSensitivity = (float)(currentFast_dBFS - target_dBA + 94.0f);
+        if (newSensitivity > 0.0f) {
+            newSensitivity = 0.0f;
+        }
         if (activeMic == MIC_EXTERNAL_PDM) {
-            sensitivity_pdm = (float)(currentFast_dBFS - target_dBA + 94.0f);
+            sensitivity_pdm = newSensitivity;
         } else {
-            sensitivity_int = (float)(currentFast_dBFS - target_dBA + 94.0f);
+            sensitivity_int = newSensitivity;
         }
         saveCalibration();
         calFlashTimer = millis() + 2000;
@@ -391,8 +399,8 @@ void handleCalibrationControls() {
 bool acquireAudioSamples() {
     if (activeMic == MIC_EXTERNAL_PDM) {
         size_t pdm_bytes_read = 0;
-        esp_err_t err = i2s_channel_read(rx_chan, (void *)rawDmaBuffer, 
-                                         activeSignalLength * 2 * sizeof(int16_t), 
+        esp_err_t err = i2s_channel_read(rx_chan, (void *)rawDmaBuffer,
+                                         activeSignalLength * 2 * sizeof(int16_t),
                                          &pdm_bytes_read, 1000 / portTICK_PERIOD_MS);
         if (err != ESP_OK || pdm_bytes_read == 0) return false;
 
@@ -427,13 +435,13 @@ bool acquireAudioSamples() {
         for (int n = 0; n < activeSignalLength; n++) {
             int16_t s = useRight ? rawDmaBuffer[n * 2 + 1] : rawDmaBuffer[n * 2];
             adcBuffer[n] = (double)s - mean;
-            vImag[n]     = 0.0;
+            vImag[n] = 0.0;
         }
-    } 
+    }
     else { // MIC_INTERNAL_ADC
         uint32_t adc_bytes_read = 0;
-        esp_err_t err = adc_continuous_read(mic_adc_handle, (uint8_t *)rawDmaBuffer, 
-                                           activeSignalLength * 2, 
+        esp_err_t err = adc_continuous_read(mic_adc_handle, (uint8_t *)rawDmaBuffer,
+                                           activeSignalLength * 2,
                                            &adc_bytes_read, 1000 / portTICK_PERIOD_MS);
         if (err != ESP_OK || adc_bytes_read == 0) return false;
 
@@ -448,7 +456,7 @@ bool acquireAudioSamples() {
 
         for (int n = 0; n < activeSignalLength; n++) {
             adcBuffer[n] = (double)adcRawSamples[n] - mean;
-            vImag[n]     = 0.0;
+            vImag[n] = 0.0;
         }
     }
 
@@ -476,7 +484,7 @@ void processAcousticsAndFFT() {
     else fastPowerFiltered = (1.0 - alpha_fast) * fastPowerFiltered + alpha_fast * frameAPower;
 
     double fast_dBFS = (fastPowerFiltered > 1e-12) ? 10.0 * log10(fastPowerFiltered) : -96.0;
-    currentLaf_dBA   = fast_dBFS - getCurrentSensitivity() + 94.0;
+    currentLaf_dBA = fast_dBFS - getCurrentSensitivity() + 94.0;
 
     // Track dominant frequency
     double rawPeak = getCleanPeakFrequency();
@@ -501,7 +509,7 @@ void renderSpectrogramColumn() {
         amp /= (activeSignalLength / 2.0);
 
         double bin_dBFS = (amp > 1.0) ? 20.0 * log10(amp / fullScale) : -96.0;
-        double bin_dBA  = bin_dBFS - currentSens + 94.0;
+        double bin_dBA = bin_dBFS - currentSens + 94.0;
 
         int colorIdx = constrain(map((int)bin_dBA, 35, 95, 0, 255), 0, 255);
         spectrogram.drawPixel(SPECTROGRAM_WIDTH - 1, y, colorLUT[colorIdx]);
@@ -536,7 +544,7 @@ void updateHeaderUI() {
         M5.Display.setTextSize(1);
         M5.Display.setTextColor(0xCE79, 0x10A2);
         M5.Display.setCursor(6, 26);
-        M5.Display.printf("[%s] %3.0fdB [A/B] | S94:%4.1f [C]", 
+        M5.Display.printf("[%s] %3.0fdB [A/B] | S94:%4.1f [C]",
             (activeMic == MIC_EXTERNAL_PDM) ? "EXT PDM 16k" : "INT ADC 44k",
             target_dBA, getCurrentSensitivity());
     }
@@ -548,8 +556,8 @@ void updateHeaderUI() {
 void setup() {
     auto cfg = M5.config();
     cfg.serial_baudrate = 115200;
-    cfg.internal_spk    = false;
-    cfg.internal_mic    = false;
+    cfg.internal_spk = false;
+    cfg.internal_mic = false;
     M5.begin(cfg);
 
     loadCalibration();
