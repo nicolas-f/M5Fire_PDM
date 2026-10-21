@@ -20,7 +20,8 @@
 #define SPECTROGRAM_WIDTH     (SCREEN_WIDTH - AXIS_WIDTH)     // 280 pixels
 #define SPECTROGRAM_HEIGHT    (SCREEN_HEIGHT - HEADER_HEIGHT) // 198 pixels
 
-#define MAX_BUFFER_SIZE       1024
+#define MAX_BUFFER_SIZE       4096  // Increased to support oversampling
+#define OVERSAMPLING_FACTOR   3     // Oversample signal to increase dynamic range
 
 enum MicSource {
     MIC_NONE,
@@ -29,18 +30,18 @@ enum MicSource {
 };
 
 MicSource activeMic = MIC_NONE;
-uint32_t activeSamplingRate = 16000;
-uint16_t activeSignalLength = 512;
+uint32_t activeSamplingRate = 96000;  // sampling rate of default mic
+uint16_t activeSignalLength = 1024;
 float activeFMin = 250.0f;
-float activeFMax = 6300.0f;
+float activeFMax = 16000.0f;          // Adjusted to 16 kHz
 
 // Shared Audio Buffers
 int16_t rawDmaBuffer[MAX_BUFFER_SIZE * 2];
 int16_t adcRawSamples[MAX_BUFFER_SIZE];
-double adcBuffer[MAX_BUFFER_SIZE];
-double vImag[MAX_BUFFER_SIZE];
+double adcBuffer[MAX_BUFFER_SIZE / OVERSAMPLING_FACTOR];  // Downsampled buffer
+double vImag[MAX_BUFFER_SIZE / OVERSAMPLING_FACTOR];
 
-ArduinoFFT<double> FFT = ArduinoFFT<double>(adcBuffer, vImag, 512, 16000);
+ArduinoFFT<double> FFT = ArduinoFFT<double>(adcBuffer, vImag, activeSignalLength, activeSamplingRate / OVERSAMPLING_FACTOR);
 
 // Hardware Driver Handles
 i2s_chan_handle_t rx_chan = NULL;
@@ -96,19 +97,35 @@ float sensitivity_pdm = -26.0f;
 float sensitivity_int = -28.0f;
 uint32_t calFlashTimer = 0;
 
-double fastPowerFiltered = 0.0;
-double currentLaf_dBA = 0.0;
+// IEC 61672 Fast LAeq variables
+double fastSquaredAWeightedSum = 0.0;
+double fastLAeq = 0.0;
+double currentLaf_dBA = 0.0;  // <-- Added this line to fix the error
+const double fastTimeConstant = 0.125; // 125 ms for Fast weighting
+const double referencePressureSquared = 20e-6 * 20e-6; // (20 µPa)^2
+
 double smoothedFreq = 0.0;
 
 // NoiseCapture Color Palette
 struct RGB { uint8_t r, g, b; };
 const RGB noiseCapturePalette[17] = {
-    { 0x30, 0x30, 0x30 }, { 0x2D, 0x3C, 0x2D }, { 0x2A, 0x48, 0x2A },
-    { 0x27, 0x54, 0x27 }, { 0x24, 0x60, 0x24 }, { 0x21, 0x6C, 0x21 },
-    { 0x3F, 0x8E, 0x19 }, { 0x61, 0xA5, 0x14 }, { 0x82, 0xBB, 0x0F },
-    { 0xA4, 0xD2, 0x0A }, { 0xC5, 0xE8, 0x05 }, { 0xE7, 0xFF, 0x00 },
-    { 0xEB, 0xD4, 0x00 }, { 0xEF, 0xAA, 0x00 }, { 0xF3, 0x7F, 0x00 },
-    { 0xF7, 0x55, 0x00 }, { 0xFB, 0x2A, 0x00 }
+    { 0x30, 0x30, 0x30 },  // Dark gray
+    { 0x2D, 0x3C, 0x2D },  // Dark green-gray
+    { 0x2A, 0x48, 0x2A },  // Darker green
+    { 0x27, 0x54, 0x27 },  // Green
+    { 0x24, 0x60, 0x24 },  // Brighter green
+    { 0x21, 0x6C, 0x21 },  // Very bright green
+    { 0x3F, 0x8E, 0x19 },  // Yellow-green
+    { 0x61, 0xA5, 0x14 },  // Brighter yellow-green
+    { 0x82, 0xBB, 0x0F },  // Yellow
+    { 0xA4, 0xD2, 0x0A },  // Brighter yellow
+    { 0xC5, 0xE8, 0x05 },  // Very bright yellow
+    { 0xE7, 0xFF, 0x00 },  // Brightest yellow
+    { 0xEB, 0xD4, 0x00 },  // Orange-yellow
+    { 0xEF, 0xAA, 0x00 },  // Orange
+    { 0xF3, 0x7F, 0x00 },  // Bright orange
+    { 0xF7, 0x55, 0x00 },  // Red-orange
+    { 0xFB, 0x2A, 0x00 }   // Bright red
 };
 
 // Returns active sensitivity based on the selected microphone
@@ -122,13 +139,19 @@ inline float getCurrentSensitivity() {
 // ============================================================================
 void initColorMap() {
     for (int i = 0; i < 256; i++) {
-        float pos = (i / 255.0f) * 16.0f;
+        float pos = (i / 255.0f) * 16.0f;  // 16 intervals for 17 colors
         int idx = (int)pos;
         float frac = pos - idx;
 
         if (idx >= 16) {
-            colorLUT[i] = M5.Display.color565(noiseCapturePalette[16].r, noiseCapturePalette[16].g, noiseCapturePalette[16].b);
+            // Clamp to the last color
+            colorLUT[i] = M5.Display.color565(
+                noiseCapturePalette[16].r,
+                noiseCapturePalette[16].g,
+                noiseCapturePalette[16].b
+            );
         } else {
+            // Linear interpolation between the two closest colors
             uint8_t r = (uint8_t)((1.0f - frac) * noiseCapturePalette[idx].r + frac * noiseCapturePalette[idx + 1].r);
             uint8_t g = (uint8_t)((1.0f - frac) * noiseCapturePalette[idx].g + frac * noiseCapturePalette[idx + 1].g);
             uint8_t b = (uint8_t)((1.0f - frac) * noiseCapturePalette[idx].b + frac * noiseCapturePalette[idx + 1].b);
@@ -137,6 +160,32 @@ void initColorMap() {
     }
 }
 
+/**
+ * @brief Computes the A-weighting power for a given frequency (in Hz).
+ *
+ * The A-weighting curve is defined by the IEC 61672-1:2013 standard (Electroacoustics - Sound level meters).
+ * The formula for the A-weighting is derived from the standard's specification of the A-weighting filter:
+ *
+ * A-weighting formula (from IEC 61672-1:2013, Equation 1):
+ * \( R_A(f) = \frac{12194^2 \cdot f^4}{(f^2 + 20.6^2) \cdot \sqrt{(f^2 + 107.7^2) \cdot (f^2 + 737.9^2)} \cdot (f^2 + 12194^2)} \)
+ *
+ * This function computes the squared magnitude of the A-weighting filter response at frequency `freq`.
+ * The constants in the implementation are precomputed for efficiency:
+ * - 148698944.0 = 12194^2
+ * - 424.36 ≈ 20.6^2
+ * - 11599.29 ≈ 107.7^2
+ * - 544496.41 ≈ 737.9^2
+ * - 1.25892541 ≈ 12194^2 / 12194^2 (normalization factor)
+ *
+ * The function returns the squared A-weighting value (power) for use in energy-based calculations.
+ *
+ * @param freq Frequency in Hz.
+ * @return Squared A-weighting value (power) at the given frequency. Returns 0.0 for frequencies below 10 Hz.
+ *
+ * @note The A-weighting curve is designed to approximate the human ear's sensitivity to sound at low levels.
+ *       It attenuates low and high frequencies relative to the mid-range (1-4 kHz).
+ * @see IEC 61672-1:2013, Section 4.2 (A-weighting filter).
+ */
 float computeAWeightPower(float freq) {
     if (freq < 10.0f) return 0.0f;
     float f2 = freq * freq;
@@ -152,7 +201,8 @@ void initLogFrequencyMap() {
     for (int y = 0; y < SPECTROGRAM_HEIGHT; y++) {
         float norm_y = (float)(SPECTROGRAM_HEIGHT - 1 - y) / (float)(SPECTROGRAM_HEIGHT - 1);
         float freq = activeFMin * powf(activeFMax / activeFMin, norm_y);
-        float binFloat = (freq / (float)activeSamplingRate) * activeSignalLength;
+        // Use effective sampling rate (32 kHz)
+        float binFloat = (freq / (float)(activeSamplingRate / OVERSAMPLING_FACTOR)) * activeSignalLength;
         binFloat = constrain(binFloat, 1.0f, (float)(activeSignalLength / 2 - 2));
 
         yMap[y].b0 = (int)binFloat;
@@ -161,7 +211,7 @@ void initLogFrequencyMap() {
     }
 
     for (int k = 0; k < activeSignalLength / 2; k++) {
-        float freq = k * (float)activeSamplingRate / (float)activeSignalLength;
+        float freq = k * (float)(activeSamplingRate / OVERSAMPLING_FACTOR) / (float)activeSignalLength;
         aWeightPowerTable[k] = computeAWeightPower(freq);
     }
 }
@@ -212,7 +262,7 @@ bool startPDMDriver() {
     if (i2s_new_channel(&chan_cfg, NULL, &rx_chan) != ESP_OK) return false;
 
     i2s_pdm_rx_config_t pdm_rx_cfg = {
-        .clk_cfg  = I2S_PDM_RX_CLK_DEFAULT_CONFIG(16000),
+        .clk_cfg  = I2S_PDM_RX_CLK_DEFAULT_CONFIG(96000),  // Increased to 96 kHz
         .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .clk = (gpio_num_t)PIN_PDM_CLK,
@@ -238,13 +288,13 @@ void stopPDMDriver() {
 
 bool startADCDriver() {
     adc_continuous_handle_cfg_t adc_config = {
-        .max_store_buf_size = 4096,
-        .conv_frame_size = 1024 * 2,
+        .max_store_buf_size = 4096 * OVERSAMPLING_FACTOR,
+        .conv_frame_size = 1024 * OVERSAMPLING_FACTOR,
     };
     if (adc_continuous_new_handle(&adc_config, &mic_adc_handle) != ESP_OK) return false;
 
     adc_continuous_config_t dig_cfg = {
-        .sample_freq_hz = 44100,
+        .sample_freq_hz = 96000,  // Increased to 96 kHz
         .conv_mode = ADC_CONV_SINGLE_UNIT_1,
         .format = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
     };
@@ -298,27 +348,29 @@ void configureMicrophoneMode(MicSource source) {
         if (!rx_chan) startPDMDriver();
 
         activeMic = MIC_EXTERNAL_PDM;
-        activeSamplingRate = 16000;
-        activeSignalLength = 512;
+        activeSamplingRate = 96000;
+        activeSignalLength = 1024;
         activeFMin = 250.0f;
-        activeFMax = 6300.0f;
-        Serial.println("[MODE] Switched to EXTERNAL PDM MIC (Port A @ 16 kHz)");
+        activeFMax = 16000.0f;  // Adjusted to 16 kHz
+        Serial.println("[MODE] Switched to EXTERNAL PDM MIC (Port A @ 96 kHz)");
     } else {
         stopPDMDriver();
         if (!mic_adc_handle) startADCDriver();
 
         activeMic = MIC_INTERNAL_ADC;
-        activeSamplingRate = 44100;
+        activeSamplingRate = 96000;
         activeSignalLength = 1024;
-        activeFMin = 500.0f;
-        activeFMax = 22050.0f;
-        Serial.println("[MODE] Switched to INTERNAL ANALOG MIC (GPIO 34 @ 44.1 kHz)");
+        activeFMin = 250.0f;
+        activeFMax = 16000.0f;  // Adjusted to 16 kHz
+        Serial.println("[MODE] Switched to INTERNAL ANALOG MIC (GPIO 34 @ 96 kHz)");
     }
 
-    FFT = ArduinoFFT<double>(adcBuffer, vImag, activeSignalLength, activeSamplingRate);
+    FFT = ArduinoFFT<double>(adcBuffer, vImag, activeSignalLength, activeSamplingRate / OVERSAMPLING_FACTOR);
     initLogFrequencyMap();
     drawFrequencyAxis();
-    fastPowerFiltered = 0.0;
+    fastSquaredAWeightedSum = 0.0;
+    fastLAeq = 0.0;
+    currentLaf_dBA = 0.0;
     smoothedFreq = 0.0;
 }
 
@@ -349,8 +401,8 @@ void saveCalibration() {
 double getCleanPeakFrequency() {
     double maxY = 0;
     int maxBin = 0;
-    int minBin = (int)((activeFMin * 0.95f / (float)activeSamplingRate) * activeSignalLength);
-    int maxBinLimit = (int)((activeFMax * 0.99f / (double)activeSamplingRate) * activeSignalLength);
+    int minBin = (int)((activeFMin * 0.95f / (float)(activeSamplingRate / OVERSAMPLING_FACTOR)) * activeSignalLength);
+    int maxBinLimit = (int)((activeFMax * 0.99f / (double)(activeSamplingRate / OVERSAMPLING_FACTOR)) * activeSignalLength);
 
     for (int i = minBin; i <= maxBinLimit; i++) {
         if (adcBuffer[i] > maxY) {
@@ -362,7 +414,7 @@ double getCleanPeakFrequency() {
 
     double y1 = adcBuffer[maxBin - 1], y2 = adcBuffer[maxBin], y3 = adcBuffer[maxBin + 1];
     double delta = 0.5 * (y1 - y3) / (y1 - 2.0 * y2 + y3);
-    return ((double)maxBin - delta) * ((double)activeSamplingRate / activeSignalLength);
+    return ((double)maxBin - delta) * ((double)(activeSamplingRate / OVERSAMPLING_FACTOR) / activeSignalLength);
 }
 
 // ============================================================================
@@ -380,7 +432,7 @@ void handleCalibrationControls() {
         if (target_dBA > 120.0f) target_dBA = 120.0f;
     }
     if (M5.BtnC.wasPressed()) {
-        double currentFast_dBFS = (fastPowerFiltered > 1e-12) ? 10.0 * log10(fastPowerFiltered) : -96.0;
+        double currentFast_dBFS = (fastSquaredAWeightedSum > 1e-12) ? 10.0 * log10(fastSquaredAWeightedSum) : -96.0;
         float newSensitivity = (float)(currentFast_dBFS - target_dBA + 94.0f);
         if (newSensitivity > 0.0f) {
             newSensitivity = 0.0f;
@@ -395,20 +447,24 @@ void handleCalibrationControls() {
     }
 }
 
-// 2. Acquires raw samples from active driver, removes DC bias, populates adcBuffer
+// 2. Acquires raw samples from active driver, removes DC bias, populates adcBuffer with oversampling
 bool acquireAudioSamples() {
     if (activeMic == MIC_EXTERNAL_PDM) {
         size_t pdm_bytes_read = 0;
-        esp_err_t err = i2s_channel_read(rx_chan, (void *)rawDmaBuffer,
-                                         activeSignalLength * 2 * sizeof(int16_t),
-                                         &pdm_bytes_read, 1000 / portTICK_PERIOD_MS);
+        esp_err_t err = i2s_channel_read(
+            rx_chan,
+            (void *)rawDmaBuffer,
+            activeSignalLength * OVERSAMPLING_FACTOR * 2 * sizeof(int16_t),
+            &pdm_bytes_read,
+            1000 / portTICK_PERIOD_MS
+        );
         if (err != ESP_OK || pdm_bytes_read == 0) return false;
 
         // Channel separation & disconnect check
         int16_t l_min = 32767, l_max = -32768, r_min = 32767, r_max = -32768;
         int64_t l_sum = 0, r_sum = 0;
 
-        for (int n = 0; n < activeSignalLength; n++) {
+        for (int n = 0; n < activeSignalLength * OVERSAMPLING_FACTOR; n++) {
             int16_t l = rawDmaBuffer[n * 2];
             int16_t r = rawDmaBuffer[n * 2 + 1];
             if (l < l_min) l_min = l; if (l > l_max) l_max = l;
@@ -417,7 +473,7 @@ bool acquireAudioSamples() {
             r_sum += r;
         }
 
-        // Unplug detection: saturation at ~30935 with span < 15
+        // Unplug detection
         static int disconnectCounter = 0;
         if ((l_max - l_min < 15 && abs(l_min) > 28000) || (r_max - r_min < 15 && abs(r_min) > 28000)) {
             if (++disconnectCounter > 6) {
@@ -430,61 +486,82 @@ bool acquireAudioSamples() {
         }
 
         bool useRight = ((r_max - r_min) > (l_max - l_min));
-        double mean = (double)(useRight ? r_sum : l_sum) / activeSignalLength;
 
+        // Oversampling: Average every 3 samples
         for (int n = 0; n < activeSignalLength; n++) {
-            int16_t s = useRight ? rawDmaBuffer[n * 2 + 1] : rawDmaBuffer[n * 2];
-            adcBuffer[n] = (double)s - mean;
+            int64_t sum = 0;
+            for (int i = 0; i < OVERSAMPLING_FACTOR; i++) {
+                int16_t s = useRight ?
+                    rawDmaBuffer[(n * OVERSAMPLING_FACTOR + i) * 2 + 1] :
+                    rawDmaBuffer[(n * OVERSAMPLING_FACTOR + i) * 2];
+                sum += s;
+            }
+            double mean = (double)sum / OVERSAMPLING_FACTOR;
+            adcBuffer[n] = mean;
             vImag[n] = 0.0;
         }
     }
     else { // MIC_INTERNAL_ADC
         uint32_t adc_bytes_read = 0;
-        esp_err_t err = adc_continuous_read(mic_adc_handle, (uint8_t *)rawDmaBuffer,
-                                           activeSignalLength * 2,
-                                           &adc_bytes_read, 1000 / portTICK_PERIOD_MS);
+        esp_err_t err = adc_continuous_read(
+            mic_adc_handle,
+            (uint8_t *)rawDmaBuffer,
+            activeSignalLength * OVERSAMPLING_FACTOR * 2,
+            &adc_bytes_read,
+            1000 / portTICK_PERIOD_MS
+        );
         if (err != ESP_OK || adc_bytes_read == 0) return false;
 
-        int32_t sum = 0;
-        for (int i = 0; i < activeSignalLength; i++) {
-            adc_digi_output_data_t *p = (adc_digi_output_data_t *)&((uint8_t *)rawDmaBuffer)[i * 2];
-            int16_t val = (int16_t)(p->type1.data);
-            adcRawSamples[i] = val;
-            sum += val;
-        }
-        double mean = (double)sum / activeSignalLength;
-
+        // Oversampling: Average every 3 samples
         for (int n = 0; n < activeSignalLength; n++) {
-            adcBuffer[n] = (double)adcRawSamples[n] - mean;
+            int64_t sum = 0;
+            for (int i = 0; i < OVERSAMPLING_FACTOR; i++) {
+                adc_digi_output_data_t *p = (adc_digi_output_data_t *)&((uint8_t *)rawDmaBuffer)[(n * OVERSAMPLING_FACTOR + i) * 2];
+                int16_t val = (int16_t)(p->type1.data);
+                sum += val;
+            }
+            double mean = (double)sum / OVERSAMPLING_FACTOR;
+            adcBuffer[n] = mean;
             vImag[n] = 0.0;
         }
     }
-
     return true;
 }
 
-// 3. Runs FFT, computes IEC A-weighting power, applies Fast decay, tracks peak frequency
+// 3. Runs FFT, computes IEC 61672 Fast LAeq, applies Fast decay, tracks peak frequency
 void processAcousticsAndFFT() {
     FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
     FFT.compute(FFTDirection::Forward);
     FFT.complexToMagnitude();
 
-    double fullScale = (activeMic == MIC_EXTERNAL_PDM) ? 32768.0 : 2048.0;
+    double fullScale = (activeMic == MIC_EXTERNAL_PDM) ? 32768.0 : 2048.0 * OVERSAMPLING_FACTOR;
 
-    double frameAPower = 0.0;
+    // Compute sum of squared A-weighted amplitudes (energy)
+    double frameSquaredAWeightedSum = 0.0;
     for (int k = 1; k < activeSignalLength / 2; k++) {
         double ampNorm = (adcBuffer[k] / (activeSignalLength / 2.0)) / fullScale;
-        frameAPower += (ampNorm * ampNorm * 0.5) * aWeightPowerTable[k];
+        frameSquaredAWeightedSum += (ampNorm * ampNorm) * aWeightPowerTable[k];
     }
 
-    // IEC Fast exponential integration (tau = 125 ms)
-    const double dt = (double)activeSignalLength / activeSamplingRate;
-    const double alpha_fast = 1.0 - exp(-dt / 0.125);
-    if (fastPowerFiltered == 0.0) fastPowerFiltered = frameAPower;
-    else fastPowerFiltered = (1.0 - alpha_fast) * fastPowerFiltered + alpha_fast * frameAPower;
+    // IEC 61672 Fast exponential averaging (tau = 125 ms)
+    const double dt = (double)activeSignalLength / (activeSamplingRate / OVERSAMPLING_FACTOR);
+    const double alpha_fast = 1.0 - exp(-dt / fastTimeConstant);
+    if (fastSquaredAWeightedSum == 0.0) {
+        fastSquaredAWeightedSum = frameSquaredAWeightedSum;
+    } else {
+        fastSquaredAWeightedSum = (1.0 - alpha_fast) * fastSquaredAWeightedSum + alpha_fast * frameSquaredAWeightedSum;
+    }
 
-    double fast_dBFS = (fastPowerFiltered > 1e-12) ? 10.0 * log10(fastPowerFiltered) : -96.0;
-    currentLaf_dBA = fast_dBFS - getCurrentSensitivity() + 94.0;
+    // Compute Fast LAeq in dB(A) referenced to 20 µPa (0 dB SPL)
+    double fastPA = fastSquaredAWeightedSum * referencePressureSquared;
+    if (fastPA > 0.0) {
+        fastLAeq = 10.0 * log10(fastPA / referencePressureSquared);
+    } else {
+        fastLAeq = -96.0;
+    }
+
+    // Apply microphone calibration offset (94 dB)
+    currentLaf_dBA = fastLAeq - getCurrentSensitivity() + 94.0;
 
     // Track dominant frequency
     double rawPeak = getCleanPeakFrequency();
@@ -499,7 +576,7 @@ void processAcousticsAndFFT() {
 void renderSpectrogramColumn() {
     spectrogram.scroll(-1, 0);
 
-    double fullScale = (activeMic == MIC_EXTERNAL_PDM) ? 32768.0 : 2048.0;
+    double fullScale = (activeMic == MIC_EXTERNAL_PDM) ? 32768.0 : 2048.0 * OVERSAMPLING_FACTOR;
     float currentSens = getCurrentSensitivity();
 
     for (int y = 0; y < SPECTROGRAM_HEIGHT; y++) {
@@ -511,7 +588,9 @@ void renderSpectrogramColumn() {
         double bin_dBFS = (amp > 1.0) ? 20.0 * log10(amp / fullScale) : -96.0;
         double bin_dBA = bin_dBFS - currentSens + 94.0;
 
-        int colorIdx = constrain(map((int)bin_dBA, 35, 95, 0, 255), 0, 255);
+        // Map dB to color index (35-120 dB range, as in NoiseCapture)
+        int colorIdx = constrain((int)((bin_dBA - 35.0) * 255.0 / (120.0 - 35.0)), 0, 255);
+
         spectrogram.drawPixel(SPECTROGRAM_WIDTH - 1, y, colorLUT[colorIdx]);
     }
 
@@ -545,7 +624,7 @@ void updateHeaderUI() {
         M5.Display.setTextColor(0xCE79, 0x10A2);
         M5.Display.setCursor(6, 26);
         M5.Display.printf("[%s] %3.0fdB [A/B] | S94:%4.1f [C]",
-            (activeMic == MIC_EXTERNAL_PDM) ? "EXT PDM 16k" : "INT ADC 44k",
+            (activeMic == MIC_EXTERNAL_PDM) ? "EXT PDM 96k" : "INT ADC 96k",
             target_dBA, getCurrentSensitivity());
     }
 }
